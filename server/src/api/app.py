@@ -107,7 +107,7 @@ def linux_permission_diagnostics(
     video_io = "Unknown"
     build_info = cv2.getBuildInformation()
     if "Video I/O:" in build_info:
-        section = build_info.split("Video I/O:", 1)[1].split("\\n\\n", 1)[0]
+        section = build_info.split("Video I/O:", 1)[1].split("\n\n", 1)[0]
         video_io = " ".join(line.strip() for line in section.splitlines() if line.strip())
 
     node_details: list[dict[str, Any]] = []
