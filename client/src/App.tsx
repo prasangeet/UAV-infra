@@ -65,10 +65,17 @@ function App() {
     return () => { active = false; };
   }, []);
 
-  useEffect(() => () => {
-    if (previewUrl) URL.revokeObjectURL(previewUrl);
-    if (cameraPollRef.current !== null) window.clearTimeout(cameraPollRef.current);
-    void fetch(`${API}/api/camera/stop`, { method: "POST" }).catch(() => undefined);
+  useEffect(() => {
+    return () => {
+      if (cameraPollRef.current !== null) window.clearTimeout(cameraPollRef.current);
+      // Stop native capture when the desktop window is closed/unmounted.
+      void fetch(`${API}/api/camera/stop`, { method: "POST" }).catch(() => undefined);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!previewUrl) return;
+    return () => URL.revokeObjectURL(previewUrl);
   }, [previewUrl]);
 
   useEffect(() => {
@@ -266,6 +273,7 @@ function App() {
                   className="annotated-preview"
                   src={`${API}/api/camera/stream?session=${cameraStreamKey}`}
                   alt="Live camera stream with YOLO detections"
+                  onError={() => setCameraError("Camera stream unavailable. Check that the inference server is running and camera capture is active.")}
                 />
               )}
               {source !== "camera" && previewUrl && source === "image" && (
