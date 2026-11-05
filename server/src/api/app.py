@@ -15,6 +15,7 @@ import torch
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 from ultralytics import YOLO
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -22,6 +23,19 @@ DEFAULT_MODEL = ROOT / "runs/detect/cubit_det_yolo11n_1024_finetune50/weights/be
 MODEL_PATH = Path(os.getenv("CUBIT_MODEL", str(DEFAULT_MODEL))).expanduser()
 DEVICE = os.getenv("CUBIT_DEVICE", "0" if torch.cuda.is_available() else "cpu")
 MAX_UPLOAD_BYTES = int(os.getenv("CUBIT_MAX_UPLOAD_MB", "100")) * 1024 * 1024
+
+# Keep inference from monopolizing every CPU core on desktop machines.
+def _positive_env_int(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.getenv(name, str(default))))
+    except ValueError:
+        return default
+
+
+TORCH_CPU_THREADS = min(os.cpu_count() or 1, _positive_env_int("CUBIT_TORCH_THREADS", 4))
+VIDEO_FRAME_STRIDE = _positive_env_int("CUBIT_VIDEO_FRAME_STRIDE", 2)
+torch.set_num_threads(TORCH_CPU_THREADS)
+cv2.setNumThreads(min(TORCH_CPU_THREADS, 2))
 
 app = FastAPI(title="CUBIT Inspect API", version="0.5.0")
 app.add_middleware(
@@ -380,6 +394,8 @@ def _video_job_snapshot(job: dict[str, Any]) -> dict[str, Any]:
         "status": job["status"],
         "progress": job["progress"],
         "current_frame": job["current_frame"],
+        "analysed_frames": job.get("analysed_frames", 0),
+        "frame_stride": job.get("frame_stride", VIDEO_FRAME_STRIDE),
         "total_frames": job["total_frames"],
         "error": job["error"],
         "summary": job["summary"],
@@ -392,8 +408,9 @@ def _process_video_scan(job_id: str, input_path: Path, output_path: Path, conf: 
     writer: cv2.VideoWriter | None = None
     processed_frames = 0
     try:
-        _update_video_job(job_id, status="processing", progress=0, error=None)
+        _update_video_job(job_id, status="loading_model", progress=0, error=None)
         model = get_model()
+        _update_video_job(job_id, status="processing", progress=0, error=None)
         capture = cv2.VideoCapture(str(input_path))
         if not capture.isOpened():
             raise RuntimeError("OpenCV could not open this video. Try MP4, MOV, AVI, MKV or WebM.")
@@ -419,29 +436,57 @@ def _process_video_scan(job_id: str, input_path: Path, output_path: Path, conf: 
         class_counts: dict[str, int] = {"Crack": 0, "Spalling": 0, "Moisture": 0}
         confidence_sums: dict[str, float] = {"Crack": 0.0, "Spalling": 0.0, "Moisture": 0.0}
         total_detections = 0
-        _update_video_job(job_id, total_frames=total_frames, fps=round(fps, 2), frame_width=width, frame_height=height)
+        analysed_frames = 0
+        last_annotated: np.ndarray | None = None
+        _update_video_job(
+            job_id,
+            total_frames=total_frames,
+            fps=round(fps, 2),
+            frame_width=width,
+            frame_height=height,
+            frame_stride=VIDEO_FRAME_STRIDE,
+        )
 
         while True:
             ok, frame = capture.read()
             if not ok or frame is None:
                 break
-            with _model_lock:
-                result = model.predict(frame, imgsz=imgsz, conf=conf, device=DEVICE, verbose=False)[0]
-            if result.boxes is not None:
-                for box in result.boxes:
-                    class_id = int(box.cls.item())
-                    raw_class_name = str(result.names.get(class_id, f"Class {class_id}"))
-                    known_classes = {"crack": "Crack", "spalling": "Spalling", "moisture": "Moisture"}
-                    class_name = known_classes.get(raw_class_name.casefold(), raw_class_name)
-                    class_counts.setdefault(class_name, 0)
-                    confidence_sums.setdefault(class_name, 0.0)
-                    class_counts[class_name] += 1
-                    confidence_sums[class_name] += float(box.conf.item())
-                    total_detections += 1
-            writer.write(result.plot())
+
+            # Run YOLO on a configurable sample of frames; reuse the previous
+            # annotated frame between samples to preserve the output frame rate.
+            should_infer = processed_frames % VIDEO_FRAME_STRIDE == 0 or last_annotated is None
+            if should_infer:
+                with _model_lock:
+                    result = model.predict(
+                        frame,
+                        imgsz=imgsz,
+                        conf=conf,
+                        device=DEVICE,
+                        verbose=False,
+                    )[0]
+                if result.boxes is not None:
+                    for box in result.boxes:
+                        class_id = int(box.cls.item())
+                        raw_class_name = str(result.names.get(class_id, f"Class {class_id}"))
+                        known_classes = {"crack": "Crack", "spalling": "Spalling", "moisture": "Moisture"}
+                        class_name = known_classes.get(raw_class_name.casefold(), raw_class_name)
+                        class_counts.setdefault(class_name, 0)
+                        confidence_sums.setdefault(class_name, 0.0)
+                        class_counts[class_name] += 1
+                        confidence_sums[class_name] += float(box.conf.item())
+                        total_detections += 1
+                last_annotated = result.plot()
+                analysed_frames += 1
+
+            writer.write(last_annotated)
             processed_frames += 1
             progress = min(99, int(processed_frames * 100 / total_frames)) if total_frames > 0 else 0
-            _update_video_job(job_id, current_frame=processed_frames, progress=progress)
+            _update_video_job(
+                job_id,
+                current_frame=processed_frames,
+                analysed_frames=analysed_frames,
+                progress=progress,
+            )
 
         if processed_frames == 0:
             raise RuntimeError("The video contains no readable frames.")
@@ -459,6 +504,8 @@ def _process_video_scan(job_id: str, input_path: Path, output_path: Path, conf: 
             "class_counts": class_counts,
             "average_confidence_by_class": average_confidence,
             "processed_frames": processed_frames,
+            "analysed_frames": analysed_frames,
+            "frame_stride": VIDEO_FRAME_STRIDE,
             "total_frames": total_frames or processed_frames,
             "fps": round(fps, 2),
             "width": width,
@@ -491,9 +538,12 @@ async def start_video_inference(
     if suffix not in VIDEO_EXTENSIONS:
         raise HTTPException(status_code=415, detail="Unsupported video format. Use MP4, MOV, M4V, AVI, MKV, MPG or WebM.")
 
-    get_model()
-    if camera.status()["running"] and not camera.stop():
-        raise HTTPException(status_code=409, detail="Stop the live camera before starting a video scan.")
+    # Never load PyTorch weights or wait for camera shutdown on the ASGI event loop.
+    camera_status = await run_in_threadpool(camera.status)
+    if camera_status["running"]:
+        stopped = await run_in_threadpool(camera.stop)
+        if not stopped:
+            raise HTTPException(status_code=409, detail="Stop the live camera before starting a video scan.")
 
     job_id = uuid4().hex
     job_dir = VIDEO_SCAN_ROOT / job_id
@@ -514,7 +564,7 @@ async def start_video_inference(
                         status_code=413,
                         detail=f"Video exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)} MB upload limit.",
                     )
-                destination.write(chunk)
+                await run_in_threadpool(destination.write, chunk)
         if upload_size == 0:
             raise HTTPException(status_code=400, detail="The uploaded video is empty.")
     except Exception:
@@ -630,16 +680,8 @@ def camera_stream() -> StreamingResponse:
     )
 
 
-async def run_image_inference(
-    file: UploadFile,
-    conf: float,
-    imgsz: int,
-) -> dict[str, Any]:
-    if not file.content_type or not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=415, detail="Upload an image file.")
-    payload = await file.read(MAX_UPLOAD_BYTES + 1)
-    if len(payload) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="Image exceeds the upload limit.")
+def process_image_payload(payload: bytes, conf: float, imgsz: int) -> dict[str, Any]:
+    """Decode and run CPU/GPU inference in a worker thread, not on the ASGI event loop."""
     image = cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_COLOR)
     if image is None:
         raise HTTPException(status_code=400, detail="Could not decode uploaded image.")
@@ -683,6 +725,21 @@ async def run_image_inference(
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Inference failed: {exc}") from exc
+
+
+async def run_image_inference(
+    file: UploadFile,
+    conf: float,
+    imgsz: int,
+) -> dict[str, Any]:
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=415, detail="Upload an image file.")
+    payload = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(payload) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Image exceeds the upload limit.")
+
+    # cv2 decoding, model initialization, prediction and annotation are blocking operations.
+    return await run_in_threadpool(process_image_payload, payload, conf, imgsz)
 
 
 @app.post("/api/infer/image")

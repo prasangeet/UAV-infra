@@ -41,3 +41,12 @@
 .video-preview-prompt>strong{max-width:100%;overflow-wrap:anywhere;color:#e3e9ee;font-size:12px}
 .video-preview-prompt>p{max-width:340px;margin:0 0 5px;color:#82909c;font-size:10px;line-height:1.6}
 
+.video-progress-track>span.indeterminate{
+  width:34%;
+  transform:translateX(-120%);
+  animation:video-progress-indeterminate 1.25s ease-in-out infinite;
+}
+@keyframes video-progress-indeterminate{
+  from{transform:translateX(-120%)}
+  to{transform:translateX(330%)}
+}
