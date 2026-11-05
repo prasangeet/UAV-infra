@@ -41,6 +41,8 @@ type VideoScanSummary = {
   class_counts: Record<string, number>;
   average_confidence_by_class: Record<string, number>;
   processed_frames: number;
+  analysed_frames: number;
+  frame_stride: number;
   total_frames: number;
   fps: number;
   width: number;
@@ -53,6 +55,8 @@ type VideoScanJob = {
   status: "queued" | "loading_model" | "processing" | "completed" | "failed";
   progress: number;
   current_frame: number;
+  analysed_frames: number;
+  frame_stride: number;
   total_frames: number;
   error: string | null;
   summary: VideoScanSummary | null;
@@ -383,6 +387,7 @@ function App() {
     moisture: videoSummary.class_counts.Moisture ?? 0,
   } : counts;
   const videoProgress = videoPhase === "uploading" ? videoUploadProgress : (videoScan?.progress ?? 0);
+  const videoFrameTotalKnown = (videoScan?.total_frames ?? 0) > 0;
 
   const engineLabel = health?.model_exists
     ? health.model_loaded ? "Model loaded" : "Checkpoint found"
@@ -614,14 +619,21 @@ function App() {
                           aria-label={videoPhase === "uploading" ? "Video upload progress" : "Video processing progress"}
                           aria-valuemin={0}
                           aria-valuemax={100}
-                          aria-valuenow={videoProgress}
+                          aria-valuenow={videoFrameTotalKnown || videoPhase === "uploading" ? videoProgress : undefined}
                         >
-                          <span style={{ width: (videoProgress) + "%" }} />
+                          <span
+                            className={videoPhase === "processing" && !videoFrameTotalKnown ? "indeterminate" : ""}
+                            style={videoFrameTotalKnown || videoPhase === "uploading" ? { width: videoProgress + "%" } : undefined}
+                          />
                         </div>
                         <div className="video-progress-meta">
                           <span>{videoPhase === "uploading" ? "Transferring file to the local inference service…" : videoScan?.status === "queued" ? "Waiting for the inference worker…" : videoScan?.status === "loading_model" ? "Loading the detection model into memory…" : "Running YOLO detection on each frame…"}</span>
-                          {videoPhase === "processing" && (videoScan?.total_frames ?? 0) > 0 && (
-                            <strong>{videoScan.current_frame.toLocaleString()} / {videoScan.total_frames.toLocaleString()} frames</strong>
+                          {videoPhase === "processing" && videoScan && (
+                            <strong>
+                              {videoFrameTotalKnown
+                                ? videoScan.current_frame.toLocaleString() + " / " + videoScan.total_frames.toLocaleString() + " frames"
+                                : videoScan.current_frame.toLocaleString() + " frames decoded · " + videoScan.analysed_frames.toLocaleString() + " analysed"}
+                            </strong>
                           )}
                         </div>
                         <p className="video-processing-note">Keep CUBIT Inspect open while the scan is running.</p>
@@ -636,7 +648,7 @@ function App() {
                         </div>
                         <div className="video-result-stats">
                           <div><strong>{videoScan.summary.total_detections.toLocaleString()}</strong><span>Defect observations</span></div>
-                          <div><strong>{videoScan.summary.processed_frames.toLocaleString()}</strong><span>Frames analysed</span></div>
+                          <div><strong>{videoScan.summary.analysed_frames.toLocaleString()}</strong><span>Frames analysed</span></div>
                           <div><strong>{videoScan.summary.duration_seconds.toFixed(1)}s</strong><span>Video duration</span></div>
                         </div>
                         <p>Annotated video is ready. Review the results above, then confirm the scan.</p>
