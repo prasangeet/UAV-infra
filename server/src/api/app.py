@@ -122,6 +122,7 @@ def linux_permission_diagnostics(
         node_details.append(
             {
                 "device": str(device),
+                "name": camera["name"],
                 "owner": owner,
                 "group": group,
                 "mode": mode,
