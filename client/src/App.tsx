@@ -18,6 +18,22 @@ type InferenceResult = {
   image: string;
   detections: Array<{ class_name: string; confidence: number }>;
 };
+type CameraDevice = {
+  device: string;
+  name: string;
+  readable: boolean;
+  writable: boolean;
+  openable: boolean;
+  error: string | null;
+  width?: number;
+  height?: number;
+};
+type CameraDiscovery = {
+  cameras: CameraDevice[];
+  count: number;
+  usable_count: number;
+  message: string;
+};
 
 const API = import.meta.env.VITE_API_URL ?? "http://127.0.0.1:8000";
 
@@ -47,6 +63,10 @@ function App() {
   const [imgsz, setImgsz] = useState(1024);
   const [fps, setFps] = useState(0);
   const [cameraStreamKey, setCameraStreamKey] = useState(0);
+  const [cameras, setCameras] = useState<CameraDevice[]>([]);
+  const [selectedCamera, setSelectedCamera] = useState("");
+  const [cameraScanMessage, setCameraScanMessage] = useState("Scanning Linux video devices…");
+  const [scanningCameras, setScanningCameras] = useState(false);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState("");
   const [annotatedFrame, setAnnotatedFrame] = useState("");
@@ -55,6 +75,7 @@ function App() {
 
   useEffect(() => {
     let active = true;
+
     fetch(`${API}/api/health`)
       .then((response) => {
         if (!response.ok) throw new Error("Inference service unavailable");
@@ -62,6 +83,29 @@ function App() {
       })
       .then((data: Health) => { if (active) setHealth(data); })
       .catch(() => { if (active) setHealth(null); });
+
+    fetch(`${API}/api/cameras`)
+      .then((response) => {
+        if (!response.ok) throw new Error("Camera discovery endpoint unavailable.");
+        return response.json() as Promise<CameraDiscovery>;
+      })
+      .then((data) => {
+        if (!active) return;
+        setCameras(data.cameras ?? []);
+        setCameraScanMessage(data.message ?? "Camera scan complete.");
+        const preferred = data.cameras?.find((camera) => camera.openable);
+        setSelectedCamera((current) => (
+          current && data.cameras?.some((camera) => camera.device === current && camera.openable)
+            ? current
+            : preferred?.device ?? ""
+        ));
+      })
+      .catch((error) => {
+        if (!active) return;
+        setCameras([]);
+        setCameraScanMessage(error instanceof Error ? error.message : "Could not discover cameras.");
+      });
+
     return () => { active = false; };
   }, []);
 
@@ -132,9 +176,13 @@ function App() {
   async function startCamera() {
     try {
       setCameraError("");
-      const response = await fetch(`${API}/api/camera/start?index=0&conf=${confidence}&imgsz=${imgsz}`, {
-        method: "POST",
-      });
+      if (!selectedCamera) {
+        throw new Error(cameraScanMessage || "No usable camera device selected. Refresh the camera list.");
+      }
+      const response = await fetch(
+        `${API}/api/camera/start?device=${encodeURIComponent(selectedCamera)}&conf=${confidence}&imgsz=${imgsz}`,
+        { method: "POST" },
+      );
       const result = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(result.detail ?? "Could not start camera.");
       setSource("camera");
@@ -185,6 +233,30 @@ function App() {
       setBusy(false);
     }
   }
+
+  async function refreshCameras() {
+    setScanningCameras(true);
+    setCameraError("");
+    try {
+      const response = await fetch(`${API}/api/cameras`);
+      const data = await response.json().catch(() => ({})) as CameraDiscovery;
+      if (!response.ok) throw new Error(data.message ?? "Camera discovery failed.");
+      setCameras(data.cameras ?? []);
+      setCameraScanMessage(data.message ?? "Camera scan complete.");
+      const preferred = data.cameras?.find((camera) => camera.openable);
+      setSelectedCamera((current) => (
+        current && data.cameras?.some((camera) => camera.device === current && camera.openable)
+          ? current
+          : preferred?.device ?? ""
+      ));
+    } catch (error) {
+      setCameraScanMessage(error instanceof Error ? error.message : "Could not discover cameras.");
+    } finally {
+      setScanningCameras(false);
+    }
+  }
+
+  const usableCameras = cameras.filter((camera) => camera.openable);
 
   const engineLabel = health?.model_exists
     ? health.model_loaded ? "Model loaded" : "Checkpoint found"
@@ -265,6 +337,26 @@ function App() {
                 <button className={source === "image" ? "tab active" : "tab"} onClick={() => { stopCamera(); setSource("image"); }}>Image</button>
                 <button className={source === "video" ? "tab active" : "tab"} onClick={() => { stopCamera(); setSource("video"); }}>Video</button>
               </div>
+              {source === "camera" && (
+                <div className="camera-controls">
+                  <select
+                    aria-label="Camera device"
+                    value={selectedCamera}
+                    onChange={(event) => setSelectedCamera(event.target.value)}
+                    disabled={cameraOn || usableCameras.length === 0}
+                  >
+                    {usableCameras.length === 0 && <option value="">No usable camera found</option>}
+                    {usableCameras.map((camera) => (
+                      <option key={camera.device} value={camera.device}>
+                        {camera.name} · {camera.device}
+                      </option>
+                    ))}
+                  </select>
+                  <button className="refresh-cameras" onClick={refreshCameras} disabled={scanningCameras || cameraOn}>
+                    {scanningCameras ? "Scanning…" : "↻"}
+                  </button>
+                </div>
+              )}
               {cameraOn && <span className="fps-counter">{fps || "—"} FPS</span>}
             </div>
             <div className="feed-stage">
@@ -284,8 +376,14 @@ function App() {
                 <div className="empty-feed">
                   <div className="camera-glyph">◉</div>
                   <strong>Camera feed is inactive</strong>
-                  <span>Connect a camera to begin real-time inspection.</span>
-                  <button className="primary-button" onClick={startCamera}>Start camera <span>→</span></button>
+                  <span>{usableCameras.length ? `Selected device: ${selectedCamera}` : cameraScanMessage}</span>
+                  {usableCameras.length > 0 ? (
+                    <button className="primary-button" onClick={startCamera}>Start camera <span>→</span></button>
+                  ) : (
+                    <button className="secondary-button" onClick={refreshCameras} disabled={scanningCameras}>
+                      {scanningCameras ? "Scanning devices…" : "Scan cameras again"}
+                    </button>
+                  )}
                 </div>
               )}
               {source === "image" && !previewUrl && (
@@ -309,7 +407,7 @@ function App() {
               <div className="feed-corner bottom-right">YOLO11N · {imgsz} PX</div>
             </div>
             <div className="feed-footer">
-              <div className="input-info"><span className="status-dot online" /> INPUT: {cameraOn ? "CAMERA 01" : selectedFile?.name ?? "NO INPUT SELECTED"}</div>
+              <div className="input-info"><span className={cameraOn ? "status-dot online" : "status-dot"} /> INPUT: {cameraOn ? selectedCamera : selectedFile?.name ?? (source === "camera" ? "NO CAMERA SELECTED" : "NO INPUT SELECTED")}</div>
               <div className="feed-actions">
                 {source === "camera" && cameraOn && <button className="secondary-button" onClick={stopCamera}>Stop camera</button>}
                 {source !== "camera" && (
