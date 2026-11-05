@@ -540,7 +540,7 @@ function App() {
                 {source !== "camera" && (
                   <label className="secondary-button file-button">
                     Browse
-                    <input type="file" accept={source === "video" ? "video/*" : "image/*"} onChange={(event) => chooseFile(event.target.files?.[0])} />
+                    <input type="file" accept={source === "video" ? "video/*" : "image/*"} disabled={source === "video" && (videoPhase === "uploading" || videoPhase === "processing")} onChange={(event) => chooseFile(event.target.files?.[0])} />
                   </label>
                 )}
                 {source === "image" && <button className="primary-button" disabled={!selectedFile || busy} onClick={inspectImage}>{busy ? "Analysing…" : "Run analysis →"}</button>}
@@ -661,7 +661,7 @@ function App() {
 
             <section className="panel detections-panel">
               <div className="panel-header">
-                <div><h2>Detected objects</h2><p>{detections.length} objects in current frame</p></div>
+                <div><h2>Detected objects</h2><p>{videoSummary ? videoSummary.total_detections.toLocaleString() + " defect observations in video" : detections.length + " objects in current frame"}</p></div>
                 <button className="more-button" aria-label="More options">···</button>
               </div>
               {source === "video" && videoSummary ? (
