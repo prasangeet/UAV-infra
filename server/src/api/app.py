@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import base64
 import os
+import time
 from pathlib import Path
-from threading import Lock
-from typing import Any
+from threading import Event, Lock, Thread
+from typing import Any, Iterator
 
 import cv2
 import numpy as np
 import torch
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from ultralytics import YOLO
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -19,7 +21,7 @@ MODEL_PATH = Path(os.getenv("CUBIT_MODEL", str(DEFAULT_MODEL))).expanduser()
 DEVICE = os.getenv("CUBIT_DEVICE", "0" if torch.cuda.is_available() else "cpu")
 MAX_UPLOAD_BYTES = int(os.getenv("CUBIT_MAX_UPLOAD_MB", "100")) * 1024 * 1024
 
-app = FastAPI(title="CUBIT Inspect API", version="0.2.0")
+app = FastAPI(title="CUBIT Inspect API", version="0.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -38,7 +40,7 @@ _model_lock = Lock()
 
 
 def get_model() -> YOLO:
-    """Load the model once, on the first inference request."""
+    """Load the configured model once, on first use."""
     global _model
     if _model is None:
         with _model_lock:
@@ -51,11 +53,178 @@ def get_model() -> YOLO:
                             "Set CUBIT_MODEL to the fine-tuned best.pt path."
                         ),
                     )
-                _model = YOLO(str(MODEL_PATH))
-                if _model.task != "detect":
-                    _model = None
-                    raise HTTPException(status_code=500, detail="Configured checkpoint is not a detection model.")
+                candidate = YOLO(str(MODEL_PATH))
+                if candidate.task != "detect":
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Configured checkpoint is not an object-detection model.",
+                    )
+                _model = candidate
     return _model
+
+
+class CameraWorker:
+    """Owns native camera access and performs inference outside the Tauri WebView."""
+
+    def __init__(self) -> None:
+        self._state_lock = Lock()
+        self._capture: cv2.VideoCapture | None = None
+        self._thread: Thread | None = None
+        self._stop = Event()
+        self._running = False
+        self._latest_jpeg: bytes | None = None
+        self._detections: list[dict[str, Any]] = []
+        self._fps = 0.0
+        self._error: str | None = None
+        self._camera_index = 0
+        self._conf = 0.25
+        self._imgsz = 1024
+        self._last_frame_at = 0.0
+
+    def start(self, index: int, conf: float, imgsz: int) -> None:
+        with self._state_lock:
+            if self._running:
+                return
+            self._error = None
+            self._latest_jpeg = None
+            self._detections = []
+            self._fps = 0.0
+            self._camera_index = index
+            self._conf = conf
+            self._imgsz = imgsz
+            self._stop.clear()
+
+            # OpenCV handles the physical device; no getUserMedia/WebView permission is involved.
+            capture = cv2.VideoCapture(index, cv2.CAP_V4L2)
+            if not capture.isOpened():
+                capture.release()
+                capture = cv2.VideoCapture(index)
+            if not capture.isOpened():
+                capture.release()
+                raise RuntimeError(
+                    f"Could not open camera {index}. Check that /dev/video{index} exists "
+                    "and your user has permission to access it (video group)."
+                )
+
+            capture.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+            capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+            self._capture = capture
+            self._running = True
+            self._thread = Thread(target=self._run, name="cubit-camera", daemon=True)
+            self._thread.start()
+
+    def _run(self) -> None:
+        previous = time.perf_counter()
+        try:
+            model = get_model()
+            while not self._stop.is_set():
+                capture = self._capture
+                if capture is None:
+                    break
+                ok, frame = capture.read()
+                if not ok or frame is None:
+                    with self._state_lock:
+                        self._error = "Camera stopped returning frames."
+                    break
+
+                # Ultralytics predictor state is shared with image inference; serialize model calls.
+                with _model_lock:
+                    result = model.predict(
+                        frame,
+                        imgsz=self._imgsz,
+                        conf=self._conf,
+                        device=DEVICE,
+                        verbose=False,
+                    )[0]
+
+                detections: list[dict[str, Any]] = []
+                if result.boxes is not None:
+                    for box in result.boxes:
+                        class_id = int(box.cls.item())
+                        detections.append(
+                            {
+                                "class_id": class_id,
+                                "class_name": result.names.get(class_id, str(class_id)),
+                                "confidence": float(box.conf.item()),
+                                "xyxy": [round(float(value), 2) for value in box.xyxy[0].tolist()],
+                            }
+                        )
+
+                annotated = result.plot()
+                success, encoded = cv2.imencode(
+                    ".jpg",
+                    annotated,
+                    [cv2.IMWRITE_JPEG_QUALITY, 84],
+                )
+                if not success:
+                    continue
+
+                now = time.perf_counter()
+                instantaneous_fps = 1.0 / max(now - previous, 1e-6)
+                previous = now
+                with self._state_lock:
+                    # Smooth the displayed value to avoid a flickering FPS counter.
+                    self._fps = instantaneous_fps if self._fps == 0 else (0.75 * self._fps + 0.25 * instantaneous_fps)
+                    self._latest_jpeg = encoded.tobytes()
+                    self._detections = detections
+                    self._last_frame_at = now
+        except Exception as exc:
+            with self._state_lock:
+                self._error = str(exc)
+        finally:
+            capture = self._capture
+            self._capture = None
+            if capture is not None:
+                capture.release()
+            with self._state_lock:
+                self._running = False
+                self._fps = 0.0
+
+    def stop(self) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread and thread.is_alive() and thread is not __import__("threading").current_thread():
+            thread.join(timeout=3.0)
+        with self._state_lock:
+            self._running = False
+            self._fps = 0.0
+        self._thread = None
+
+    def status(self) -> dict[str, Any]:
+        with self._state_lock:
+            return {
+                "running": self._running,
+                "camera_index": self._camera_index,
+                "fps": round(self._fps, 1),
+                "detections": list(self._detections),
+                "error": self._error,
+                "has_frame": self._latest_jpeg is not None,
+            }
+
+    def stream(self) -> Iterator[bytes]:
+        last_sent = None
+        while True:
+            with self._state_lock:
+                running = self._running
+                frame = self._latest_jpeg
+            if frame is not None and frame is not last_sent:
+                last_sent = frame
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n"
+                    b"Cache-Control: no-cache\r\n\r\n" + frame + b"\r\n"
+                )
+            elif not running:
+                break
+            time.sleep(0.03)
+
+
+camera = CameraWorker()
+
+
+@app.on_event("shutdown")
+def shutdown_camera() -> None:
+    camera.stop()
 
 
 @app.get("/api/health")
@@ -80,6 +249,41 @@ def model_info() -> dict[str, Any]:
     }
 
 
+@app.post("/api/camera/start")
+def start_camera(
+    index: int = Query(0, ge=0, le=15),
+    conf: float = Query(0.25, ge=0.0, le=1.0),
+    imgsz: int = Query(1024, ge=32, le=2048),
+) -> dict[str, Any]:
+    # Fail before opening the camera if the fine-tuned checkpoint is not configured.
+    get_model()
+    try:
+        camera.start(index, conf, imgsz)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"status": "starting", **camera.status()}
+
+
+@app.post("/api/camera/stop")
+def stop_camera() -> dict[str, Any]:
+    camera.stop()
+    return {"status": "stopped", **camera.status()}
+
+
+@app.get("/api/camera/status")
+def camera_status() -> dict[str, Any]:
+    return camera.status()
+
+
+@app.get("/api/camera/stream")
+def camera_stream() -> StreamingResponse:
+    return StreamingResponse(
+        camera.stream(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+        headers={"Cache-Control": "no-cache, no-store", "Pragma": "no-cache"},
+    )
+
+
 async def run_image_inference(
     file: UploadFile,
     conf: float,
@@ -96,7 +300,6 @@ async def run_image_inference(
 
     model = get_model()
     try:
-        # Ultralytics predictors are stateful; serialize access for the single-GPU desktop use case.
         with _model_lock:
             result = model.predict(
                 image,
@@ -105,7 +308,7 @@ async def run_image_inference(
                 device=DEVICE,
                 verbose=False,
             )[0]
-        detections: list[dict[str, Any]] = []
+        detections = []
         if result.boxes is not None:
             for box in result.boxes:
                 class_id = int(box.cls.item())
@@ -144,14 +347,4 @@ async def infer_image(
     conf: float = Query(0.25, ge=0.0, le=1.0),
     imgsz: int = Query(1024, ge=32, le=2048),
 ) -> dict[str, Any]:
-    return await run_image_inference(file, conf, imgsz)
-
-
-@app.post("/api/infer/frame")
-async def infer_frame(
-    file: UploadFile = File(...),
-    conf: float = Query(0.25, ge=0.0, le=1.0),
-    imgsz: int = Query(1024, ge=32, le=2048),
-) -> dict[str, Any]:
-    """Single-frame inference endpoint for the desktop live-camera loop."""
     return await run_image_inference(file, conf, imgsz)
