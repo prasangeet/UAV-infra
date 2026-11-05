@@ -37,6 +37,7 @@ type CameraDiagnostics = {
   opencv_video_io: string;
   device_nodes: Array<{
     device: string;
+    name: string;
     owner: string;
     group: string;
     mode: string;
