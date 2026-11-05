@@ -430,7 +430,9 @@ def _process_video_scan(job_id: str, input_path: Path, output_path: Path, conf: 
             if result.boxes is not None:
                 for box in result.boxes:
                     class_id = int(box.cls.item())
-                    class_name = str(result.names.get(class_id, f"Class {class_id}"))
+                    raw_class_name = str(result.names.get(class_id, f"Class {class_id}"))
+                    known_classes = {"crack": "Crack", "spalling": "Spalling", "moisture": "Moisture"}
+                    class_name = known_classes.get(raw_class_name.casefold(), raw_class_name)
                     class_counts.setdefault(class_name, 0)
                     confidence_sums.setdefault(class_name, 0.0)
                     class_counts[class_name] += 1
@@ -470,11 +472,13 @@ def _process_video_scan(job_id: str, input_path: Path, output_path: Path, conf: 
         )
     except Exception as exc:
         _update_video_job(job_id, status="failed", error=f"{type(exc).__name__}: {exc}")
+        output_path.unlink(missing_ok=True)
     finally:
         if capture is not None:
             capture.release()
         if writer is not None:
             writer.release()
+        input_path.unlink(missing_ok=True)
 
 
 @app.post("/api/infer/video", status_code=202)
