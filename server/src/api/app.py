@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import base64
+import grp
 import os
+import pwd
 import time
 from pathlib import Path
 from threading import Event, Lock, Thread, current_thread
@@ -79,6 +81,98 @@ def camera_name(device: Path) -> str:
         return device.name
 
 
+def linux_permission_diagnostics(
+    nodes: list[Path],
+    cameras: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Explain the current backend process' Linux camera access context."""
+    uid = os.geteuid()
+    gid = os.getegid()
+    username = pwd.getpwuid(uid).pw_name
+    effective_groups = set(os.getgroups()) | {gid}
+    group_names = sorted(
+        {
+            grp.getgrgid(group_id).gr_name
+            for group_id in effective_groups
+            if _group_exists(group_id)
+        }
+    )
+    try:
+        video_gid = grp.getgrnam("video").gr_gid
+        video_group_exists = True
+    except KeyError:
+        video_gid = None
+        video_group_exists = False
+
+    video_io = "Unknown"
+    build_info = cv2.getBuildInformation()
+    if "Video I/O:" in build_info:
+        section = build_info.split("Video I/O:", 1)[1].split("\\n\\n", 1)[0]
+        video_io = " ".join(line.strip() for line in section.splitlines() if line.strip())
+
+    node_details: list[dict[str, Any]] = []
+    for device, camera in zip(nodes, cameras):
+        try:
+            metadata = device.stat()
+            owner = pwd.getpwuid(metadata.st_uid).pw_name
+            group = grp.getgrgid(metadata.st_gid).gr_name
+            mode = oct(metadata.st_mode & 0o777)
+        except (OSError, KeyError):
+            owner, group, mode = "unknown", "unknown", "unknown"
+        node_details.append(
+            {
+                "device": str(device),
+                "owner": owner,
+                "group": group,
+                "mode": mode,
+                "readable": camera["readable"],
+                "writable": camera["writable"],
+                "openable": camera["openable"],
+                "error": camera["error"],
+            }
+        )
+
+    is_video_member = video_gid in effective_groups if video_gid is not None else False
+    if not nodes:
+        recommendation = (
+            "The backend sees no /dev/video* nodes. This is not a Tauri permission prompt. "
+            "Check that Linux detects the webcam and that the service is running on the host."
+        )
+    elif not any(camera["openable"] for camera in cameras):
+        if not any(camera["readable"] and camera["writable"] for camera in cameras):
+            recommendation = (
+                "The backend cannot read/write the camera nodes. Check device ACLs and group "
+                "membership. The setup script can add your user to the video group."
+            )
+        else:
+            recommendation = (
+                "The backend can access the device nodes but OpenCV could not capture a frame. "
+                "Check whether these are metadata nodes, whether another app is using the camera, "
+                "and whether the OpenCV build has V4L2 support."
+            )
+    else:
+        recommendation = "At least one camera node is accessible and can return frames."
+
+    return {
+        "username": username,
+        "uid": uid,
+        "effective_groups": group_names,
+        "video_group_exists": video_group_exists,
+        "video_group_member": is_video_member,
+        "opencv_video_io": video_io,
+        "device_nodes": node_details,
+        "recommendation": recommendation,
+    }
+
+
+def _group_exists(group_id: int) -> bool:
+    try:
+        grp.getgrgid(group_id)
+        return True
+    except KeyError:
+        return False
+
+
 def inspect_camera(device: Path) -> dict[str, Any]:
     """Probe a V4L2 node and report why it cannot be used."""
     readable = os.access(device, os.R_OK)
@@ -151,11 +245,13 @@ def list_cameras() -> dict[str, Any]:
     else:
         message = f"Found {len(usable)} usable camera capture device(s)."
 
+    diagnostics = linux_permission_diagnostics(nodes, cameras)
     return {
         "cameras": cameras,
         "count": len(cameras),
         "usable_count": len(usable),
         "message": message,
+        "diagnostics": diagnostics,
     }
 
 
@@ -394,7 +490,12 @@ def start_camera(
     try:
         camera.start(device, conf, imgsz)
     except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        # Include live OS diagnostics so the UI reports a real cause, not just "camera not found".
+        discovery = list_cameras()
+        raise HTTPException(
+            status_code=409,
+            detail={"message": str(exc), "diagnostics": discovery["diagnostics"]},
+        ) from exc
     return {"status": "starting", **camera.status()}
 
 
