@@ -4,7 +4,7 @@ import base64
 import os
 import time
 from pathlib import Path
-from threading import Event, Lock, Thread
+from threading import Event, Lock, Thread, current_thread
 from typing import Any, Iterator
 
 import cv2
@@ -21,7 +21,7 @@ MODEL_PATH = Path(os.getenv("CUBIT_MODEL", str(DEFAULT_MODEL))).expanduser()
 DEVICE = os.getenv("CUBIT_DEVICE", "0" if torch.cuda.is_available() else "cpu")
 MAX_UPLOAD_BYTES = int(os.getenv("CUBIT_MAX_UPLOAD_MB", "100")) * 1024 * 1024
 
-app = FastAPI(title="CUBIT Inspect API", version="0.3.0")
+app = FastAPI(title="CUBIT Inspect API", version="0.4.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -40,7 +40,7 @@ _model_lock = Lock()
 
 
 def get_model() -> YOLO:
-    """Load the configured model once, on first use."""
+    """Load and validate the configured model once."""
     global _model
     if _model is None:
         with _model_lock:
@@ -50,7 +50,7 @@ def get_model() -> YOLO:
                         status_code=503,
                         detail=(
                             f"Model checkpoint not found: {MODEL_PATH}. "
-                            "Set CUBIT_MODEL to the fine-tuned best.pt path."
+                            "Set CUBIT_MODEL to your fine-tuned best.pt path."
                         ),
                     )
                 candidate = YOLO(str(MODEL_PATH))
@@ -64,37 +64,31 @@ def get_model() -> YOLO:
 
 
 class CameraWorker:
-    """Owns native camera access and performs inference outside the Tauri WebView."""
+    """Captures frames with OpenCV and runs YOLO outside the Tauri WebView."""
 
     def __init__(self) -> None:
+        self._lifecycle_lock = Lock()
         self._state_lock = Lock()
         self._capture: cv2.VideoCapture | None = None
         self._thread: Thread | None = None
-        self._stop = Event()
+        self._stop_event = Event()
         self._running = False
         self._latest_jpeg: bytes | None = None
+        self._frame_sequence = 0
         self._detections: list[dict[str, Any]] = []
         self._fps = 0.0
         self._error: str | None = None
         self._camera_index = 0
-        self._conf = 0.25
-        self._imgsz = 1024
-        self._last_frame_at = 0.0
+        self._frame_size = (0, 0)
 
     def start(self, index: int, conf: float, imgsz: int) -> None:
-        with self._state_lock:
-            if self._running:
-                return
-            self._error = None
-            self._latest_jpeg = None
-            self._detections = []
-            self._fps = 0.0
-            self._camera_index = index
-            self._conf = conf
-            self._imgsz = imgsz
-            self._stop.clear()
+        with self._lifecycle_lock:
+            with self._state_lock:
+                if self._thread is not None and self._thread.is_alive():
+                    if self._running:
+                        raise RuntimeError("Camera is already running.")
+                    raise RuntimeError("Camera worker is still shutting down. Try again shortly.")
 
-            # OpenCV handles the physical device; no getUserMedia/WebView permission is involved.
             capture = cv2.VideoCapture(index, cv2.CAP_V4L2)
             if not capture.isOpened():
                 capture.release()
@@ -102,37 +96,50 @@ class CameraWorker:
             if not capture.isOpened():
                 capture.release()
                 raise RuntimeError(
-                    f"Could not open camera {index}. Check that /dev/video{index} exists "
-                    "and your user has permission to access it (video group)."
+                    f"Could not open camera {index} (/dev/video{index}). "
+                    "Check that the device exists and your user can access it. "
+                    "On Linux, inspect /dev/video* permissions and your video group membership."
                 )
 
             capture.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
             capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-            self._capture = capture
-            self._running = True
-            self._thread = Thread(target=self._run, name="cubit-camera", daemon=True)
-            self._thread.start()
+            self._stop_event.clear()
 
-    def _run(self) -> None:
+            with self._state_lock:
+                self._capture = capture
+                self._camera_index = index
+                self._frame_size = (0, 0)
+                self._latest_jpeg = None
+                self._frame_sequence = 0
+                self._detections = []
+                self._fps = 0.0
+                self._error = None
+                self._running = True
+                self._thread = Thread(
+                    target=self._run,
+                    args=(capture, conf, imgsz),
+                    name="cubit-camera",
+                    daemon=True,
+                )
+                self._thread.start()
+
+    def _run(self, capture: cv2.VideoCapture, conf: float, imgsz: int) -> None:
         previous = time.perf_counter()
         try:
             model = get_model()
-            while not self._stop.is_set():
-                capture = self._capture
-                if capture is None:
-                    break
+            while not self._stop_event.is_set():
                 ok, frame = capture.read()
                 if not ok or frame is None:
-                    with self._state_lock:
-                        self._error = "Camera stopped returning frames."
+                    if not self._stop_event.is_set():
+                        with self._state_lock:
+                            self._error = "OpenCV could not read a frame from the camera."
                     break
 
-                # Ultralytics predictor state is shared with image inference; serialize model calls.
                 with _model_lock:
                     result = model.predict(
                         frame,
-                        imgsz=self._imgsz,
-                        conf=self._conf,
+                        imgsz=imgsz,
+                        conf=conf,
                         device=DEVICE,
                         verbose=False,
                     )[0]
@@ -146,49 +153,63 @@ class CameraWorker:
                                 "class_id": class_id,
                                 "class_name": result.names.get(class_id, str(class_id)),
                                 "confidence": float(box.conf.item()),
-                                "xyxy": [round(float(value), 2) for value in box.xyxy[0].tolist()],
+                                "xyxy": [round(float(v), 2) for v in box.xyxy[0].tolist()],
                             }
                         )
 
                 annotated = result.plot()
-                success, encoded = cv2.imencode(
-                    ".jpg",
-                    annotated,
-                    [cv2.IMWRITE_JPEG_QUALITY, 84],
+                encoded_ok, encoded = cv2.imencode(
+                    ".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 84]
                 )
-                if not success:
+                if not encoded_ok:
                     continue
 
                 now = time.perf_counter()
                 instantaneous_fps = 1.0 / max(now - previous, 1e-6)
                 previous = now
                 with self._state_lock:
-                    # Smooth the displayed value to avoid a flickering FPS counter.
-                    self._fps = instantaneous_fps if self._fps == 0 else (0.75 * self._fps + 0.25 * instantaneous_fps)
+                    self._fps = (
+                        instantaneous_fps
+                        if self._fps == 0
+                        else 0.75 * self._fps + 0.25 * instantaneous_fps
+                    )
                     self._latest_jpeg = encoded.tobytes()
+                    self._frame_sequence += 1
+                    self._frame_size = (int(frame.shape[1]), int(frame.shape[0]))
                     self._detections = detections
-                    self._last_frame_at = now
         except Exception as exc:
             with self._state_lock:
-                self._error = str(exc)
+                self._error = f"{type(exc).__name__}: {exc}"
         finally:
-            capture = self._capture
-            self._capture = None
-            if capture is not None:
-                capture.release()
+            capture.release()
             with self._state_lock:
+                if self._capture is capture:
+                    self._capture = None
                 self._running = False
                 self._fps = 0.0
 
-    def stop(self) -> None:
-        self._stop.set()
-        thread = self._thread
-        if thread and thread.is_alive() and thread is not __import__("threading").current_thread():
-            thread.join(timeout=3.0)
-        with self._state_lock:
-            self._running = False
-            self._fps = 0.0
-        self._thread = None
+    def stop(self) -> bool:
+        with self._lifecycle_lock:
+            with self._state_lock:
+                self._stop_event.set()
+                thread = self._thread
+                capture = self._capture
+
+            if capture is not None:
+                capture.release()
+            if thread is not None and thread.is_alive() and thread is not current_thread():
+                thread.join(timeout=8.0)
+
+            with self._state_lock:
+                still_alive = thread is not None and thread.is_alive()
+                if not still_alive:
+                    self._thread = None
+                    self._capture = None
+                    self._running = False
+                    self._fps = 0.0
+                else:
+                    self._error = "Camera worker is still stopping. Wait briefly before restarting."
+                return not still_alive
 
     def status(self) -> dict[str, Any]:
         with self._state_lock:
@@ -199,24 +220,31 @@ class CameraWorker:
                 "detections": list(self._detections),
                 "error": self._error,
                 "has_frame": self._latest_jpeg is not None,
+                "frame_sequence": self._frame_sequence,
+                "frame_width": self._frame_size[0],
+                "frame_height": self._frame_size[1],
             }
 
     def stream(self) -> Iterator[bytes]:
-        last_sent = None
+        last_sequence = -1
         while True:
             with self._state_lock:
                 running = self._running
                 frame = self._latest_jpeg
-            if frame is not None and frame is not last_sent:
-                last_sent = frame
+                sequence = self._frame_sequence
+
+            if frame is not None and sequence != last_sequence:
+                last_sequence = sequence
                 yield (
                     b"--frame\r\n"
                     b"Content-Type: image/jpeg\r\n"
-                    b"Cache-Control: no-cache\r\n\r\n" + frame + b"\r\n"
+                    b"Cache-Control: no-cache\r\n\r\n"
+                    + frame
+                    + b"\r\n"
                 )
             elif not running:
-                break
-            time.sleep(0.03)
+                return
+            time.sleep(0.02)
 
 
 camera = CameraWorker()
@@ -255,18 +283,19 @@ def start_camera(
     conf: float = Query(0.25, ge=0.0, le=1.0),
     imgsz: int = Query(1024, ge=32, le=2048),
 ) -> dict[str, Any]:
-    # Fail before opening the camera if the fine-tuned checkpoint is not configured.
     get_model()
     try:
         camera.start(index, conf, imgsz)
     except RuntimeError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {"status": "starting", **camera.status()}
 
 
 @app.post("/api/camera/stop")
 def stop_camera() -> dict[str, Any]:
-    camera.stop()
+    stopped = camera.stop()
+    if not stopped:
+        raise HTTPException(status_code=503, detail=camera.status()["error"])
     return {"status": "stopped", **camera.status()}
 
 
@@ -317,16 +346,14 @@ async def run_image_inference(
                         "class_id": class_id,
                         "class_name": result.names.get(class_id, str(class_id)),
                         "confidence": float(box.conf.item()),
-                        "xyxy": [round(float(value), 2) for value in box.xyxy[0].tolist()],
+                        "xyxy": [round(float(v), 2) for v in box.xyxy[0].tolist()],
                     }
                 )
         annotated = result.plot()
-        success, encoded = cv2.imencode(
-            ".jpg",
-            annotated,
-            [cv2.IMWRITE_JPEG_QUALITY, 88],
+        encoded_ok, encoded = cv2.imencode(
+            ".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 88]
         )
-        if not success:
+        if not encoded_ok:
             raise HTTPException(status_code=500, detail="Could not encode annotated result.")
         return {
             "image": base64.b64encode(encoded.tobytes()).decode("ascii"),
