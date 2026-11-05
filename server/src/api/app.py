@@ -394,6 +394,8 @@ def _video_job_snapshot(job: dict[str, Any]) -> dict[str, Any]:
         "status": job["status"],
         "progress": job["progress"],
         "current_frame": job["current_frame"],
+        "analysed_frames": job.get("analysed_frames", 0),
+        "frame_stride": job.get("frame_stride", VIDEO_FRAME_STRIDE),
         "total_frames": job["total_frames"],
         "error": job["error"],
         "summary": job["summary"],
