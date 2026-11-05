@@ -3,7 +3,9 @@ from __future__ import annotations
 import base64
 import os
 import time
+import tempfile
 from pathlib import Path
+from uuid import uuid4
 from threading import Event, Lock, Thread, current_thread
 from typing import Any, Iterator
 
@@ -12,7 +14,7 @@ import numpy as np
 import torch
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from ultralytics import YOLO
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -355,6 +357,214 @@ class CameraWorker:
 
 
 camera = CameraWorker()
+
+
+VIDEO_SCAN_ROOT = Path(tempfile.gettempdir()) / "cubit-inspect-video-scans"
+VIDEO_SCAN_ROOT.mkdir(parents=True, exist_ok=True)
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm", ".mpg", ".mpeg"}
+_video_jobs: dict[str, dict[str, Any]] = {}
+_video_jobs_lock = Lock()
+
+
+def _update_video_job(job_id: str, **changes: Any) -> None:
+    with _video_jobs_lock:
+        job = _video_jobs.get(job_id)
+        if job is not None:
+            job.update(changes)
+
+
+def _video_job_snapshot(job: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "job_id": job["job_id"],
+        "filename": job["filename"],
+        "status": job["status"],
+        "progress": job["progress"],
+        "current_frame": job["current_frame"],
+        "total_frames": job["total_frames"],
+        "error": job["error"],
+        "summary": job["summary"],
+        "result_url": f'/api/infer/video/{job["job_id"]}/result' if job["status"] == "completed" else None,
+    }
+
+
+def _process_video_scan(job_id: str, input_path: Path, output_path: Path, conf: float, imgsz: int) -> None:
+    capture: cv2.VideoCapture | None = None
+    writer: cv2.VideoWriter | None = None
+    processed_frames = 0
+    try:
+        _update_video_job(job_id, status="processing", progress=0, error=None)
+        model = get_model()
+        capture = cv2.VideoCapture(str(input_path))
+        if not capture.isOpened():
+            raise RuntimeError("OpenCV could not open this video. Try MP4, MOV, AVI, MKV or WebM.")
+
+        total_frames = max(0, int(capture.get(cv2.CAP_PROP_FRAME_COUNT)))
+        fps = float(capture.get(cv2.CAP_PROP_FPS))
+        if not fps or fps <= 0 or not np.isfinite(fps):
+            fps = 25.0
+        width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if width <= 0 or height <= 0:
+            raise RuntimeError("The uploaded video has invalid frame dimensions.")
+
+        writer = cv2.VideoWriter(
+            str(output_path),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            fps,
+            (width, height),
+        )
+        if not writer.isOpened():
+            raise RuntimeError("Could not create the annotated MP4. Check OpenCV video codec support.")
+
+        class_counts: dict[str, int] = {"Crack": 0, "Spalling": 0, "Moisture": 0}
+        confidence_sums: dict[str, float] = {"Crack": 0.0, "Spalling": 0.0, "Moisture": 0.0}
+        total_detections = 0
+        _update_video_job(job_id, total_frames=total_frames, fps=round(fps, 2), frame_width=width, frame_height=height)
+
+        while True:
+            ok, frame = capture.read()
+            if not ok or frame is None:
+                break
+            with _model_lock:
+                result = model.predict(frame, imgsz=imgsz, conf=conf, device=DEVICE, verbose=False)[0]
+            if result.boxes is not None:
+                for box in result.boxes:
+                    class_id = int(box.cls.item())
+                    raw_class_name = str(result.names.get(class_id, f"Class {class_id}"))
+                    known_classes = {"crack": "Crack", "spalling": "Spalling", "moisture": "Moisture"}
+                    class_name = known_classes.get(raw_class_name.casefold(), raw_class_name)
+                    class_counts.setdefault(class_name, 0)
+                    confidence_sums.setdefault(class_name, 0.0)
+                    class_counts[class_name] += 1
+                    confidence_sums[class_name] += float(box.conf.item())
+                    total_detections += 1
+            writer.write(result.plot())
+            processed_frames += 1
+            progress = min(99, int(processed_frames * 100 / total_frames)) if total_frames > 0 else 0
+            _update_video_job(job_id, current_frame=processed_frames, progress=progress)
+
+        if processed_frames == 0:
+            raise RuntimeError("The video contains no readable frames.")
+        writer.release()
+        writer = None
+        capture.release()
+        capture = None
+
+        average_confidence = {
+            name: round(confidence_sums[name] / count, 4) if count else 0.0
+            for name, count in class_counts.items()
+        }
+        summary = {
+            "total_detections": total_detections,
+            "class_counts": class_counts,
+            "average_confidence_by_class": average_confidence,
+            "processed_frames": processed_frames,
+            "total_frames": total_frames or processed_frames,
+            "fps": round(fps, 2),
+            "width": width,
+            "height": height,
+            "duration_seconds": round(processed_frames / fps, 2),
+        }
+        _update_video_job(
+            job_id, status="completed", progress=100,
+            current_frame=processed_frames, total_frames=total_frames or processed_frames,
+            summary=summary, error=None,
+        )
+    except Exception as exc:
+        _update_video_job(job_id, status="failed", error=f"{type(exc).__name__}: {exc}")
+        output_path.unlink(missing_ok=True)
+    finally:
+        if capture is not None:
+            capture.release()
+        if writer is not None:
+            writer.release()
+        input_path.unlink(missing_ok=True)
+
+
+@app.post("/api/infer/video", status_code=202)
+async def start_video_inference(
+    file: UploadFile = File(...),
+    conf: float = Query(0.25, ge=0.0, le=1.0),
+    imgsz: int = Query(1024, ge=32, le=2048),
+) -> dict[str, Any]:
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix not in VIDEO_EXTENSIONS:
+        raise HTTPException(status_code=415, detail="Unsupported video format. Use MP4, MOV, M4V, AVI, MKV, MPG or WebM.")
+
+    get_model()
+    if camera.status()["running"] and not camera.stop():
+        raise HTTPException(status_code=409, detail="Stop the live camera before starting a video scan.")
+
+    job_id = uuid4().hex
+    job_dir = VIDEO_SCAN_ROOT / job_id
+    job_dir.mkdir(parents=True, exist_ok=False)
+    input_path = job_dir / f"source{suffix}"
+    output_path = job_dir / "annotated.mp4"
+    upload_size = 0
+
+    try:
+        with input_path.open("wb") as destination:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                upload_size += len(chunk)
+                if upload_size > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Video exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)} MB upload limit.",
+                    )
+                destination.write(chunk)
+        if upload_size == 0:
+            raise HTTPException(status_code=400, detail="The uploaded video is empty.")
+    except Exception:
+        input_path.unlink(missing_ok=True)
+        try:
+            job_dir.rmdir()
+        except OSError:
+            pass
+        raise
+    finally:
+        await file.close()
+
+    job = {
+        "job_id": job_id, "filename": Path(file.filename or "video").name,
+        "status": "queued", "progress": 0, "current_frame": 0, "total_frames": 0,
+        "error": None, "summary": None, "input_path": input_path, "output_path": output_path,
+    }
+    with _video_jobs_lock:
+        _video_jobs[job_id] = job
+
+    Thread(
+        target=_process_video_scan,
+        args=(job_id, input_path, output_path, conf, imgsz),
+        name=f"cubit-video-{job_id[:8]}",
+        daemon=True,
+    ).start()
+    return _video_job_snapshot(job)
+
+
+@app.get("/api/infer/video/{job_id}")
+def get_video_inference_status(job_id: str) -> dict[str, Any]:
+    with _video_jobs_lock:
+        job = _video_jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Video scan not found.")
+        return _video_job_snapshot(job)
+
+
+@app.get("/api/infer/video/{job_id}/result")
+def get_video_inference_result(job_id: str) -> FileResponse:
+    with _video_jobs_lock:
+        job = _video_jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Video scan not found.")
+        if job["status"] != "completed":
+            raise HTTPException(status_code=409, detail="The annotated video is not ready yet.")
+        output_path = job["output_path"]
+    if not output_path.is_file():
+        raise HTTPException(status_code=404, detail="The annotated video file is missing.")
+    return FileResponse(output_path, media_type="video/mp4")
 
 
 @app.on_event("shutdown")
