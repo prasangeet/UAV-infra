@@ -4,26 +4,23 @@ Research and application workspace for UAV-assisted infrastructure damage detect
 
 ## CUBIT Inspect
 
-The `client/` directory contains the Tauri 2 + React + TypeScript desktop application. The `server/` directory contains model training, evaluation, inference scripts, and the FastAPI service used by the desktop client.
+- `client/`: Tauri 2 + React + TypeScript desktop application.
+- `server/`: model training, evaluation, inference scripts, and FastAPI inference service.
+- Fine-tuned YOLO11n classes: Crack, Spalling, Moisture.
 
-### Stack
+## Start the application
 
-- Desktop: Tauri 2, React, TypeScript, Vite
-- Inference API: FastAPI, OpenCV, Ultralytics YOLO
-- Model: fine-tuned YOLO11n trained on CUBIT-Det (Crack, Spalling, Moisture)
-
-### Development
-
-Start the inference API in one terminal:
+Terminal 1 — Python inference service:
 
 ```fish
 cd server
-set -gx CUBIT_MODEL /absolute/path/to/best.pt
 uv sync
+set -gx CUBIT_MODEL /absolute/path/to/cubit_det_yolo11n_1024_finetune50/weights/best.pt
+set -gx CUBIT_DEVICE 0
 uv run uvicorn src.api.app:app --host 127.0.0.1 --port 8000
 ```
 
-Start the desktop client in another terminal:
+Terminal 2 — Tauri desktop app:
 
 ```fish
 cd client
@@ -31,4 +28,8 @@ pnpm install
 pnpm tauri dev
 ```
 
-The API loads model weights on the first inference request. Keep checkpoints, datasets, run outputs, and private captures outside Git.
+## Camera pipeline
+
+Camera capture is handled directly by Python/OpenCV through the Linux V4L2 interface. YOLO runs in the same local inference service, and the annotated frames are rendered by the Tauri React client using an MJPEG stream. Browser `getUserMedia` permissions are not used.
+
+The model checkpoint, datasets, run outputs, and private captures are not stored in Git.
