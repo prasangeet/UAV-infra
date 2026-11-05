@@ -32,3 +32,12 @@
 .video-failed-icon{display:flex;width:27px;height:27px;align-items:center;justify-content:center;border-radius:50%;background:#3c2524;color:#e99b85;font-weight:700}
 .video-detection-summary .confidence-value{min-width:50px;text-align:right}
 @media(max-width:700px){.video-file-facts{grid-template-columns:repeat(2,minmax(0,1fr))}.video-review-actions,.video-progress-meta{align-items:flex-start;flex-direction:column}.video-result-stats{gap:6px}.video-result-stats>div{padding:8px}.video-result-stats strong{font-size:13px}}
+
+/* Avoid initializing WebKit's native media decoder on file selection/upload. */
+.video-preview-shell{width:100%;height:100%;min-height:280px;display:flex;align-items:center;justify-content:center;background:#10171e}
+.video-preview-shell .media-preview{width:100%;height:100%;max-height:100%;object-fit:contain}
+.video-preview-prompt{width:min(100%,420px);min-height:240px;box-sizing:border-box;padding:28px;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:10px;text-align:center}
+.video-preview-symbol{width:48px;height:48px;display:grid;place-items:center;border:1px solid #45515d;border-radius:50%;color:#e6a47e;font-size:22px}
+.video-preview-prompt>strong{max-width:100%;overflow-wrap:anywhere;color:#e3e9ee;font-size:12px}
+.video-preview-prompt>p{max-width:340px;margin:0 0 5px;color:#82909c;font-size:10px;line-height:1.6}
+
