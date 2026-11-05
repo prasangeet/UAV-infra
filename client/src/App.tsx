@@ -28,11 +28,31 @@ type CameraDevice = {
   width?: number;
   height?: number;
 };
+type CameraDiagnostics = {
+  username: string;
+  uid: number;
+  effective_groups: string[];
+  video_group_exists: boolean;
+  video_group_member: boolean;
+  opencv_video_io: string;
+  device_nodes: Array<{
+    device: string;
+    owner: string;
+    group: string;
+    mode: string;
+    readable: boolean;
+    writable: boolean;
+    openable: boolean;
+    error: string | null;
+  }>;
+  recommendation: string;
+};
 type CameraDiscovery = {
   cameras: CameraDevice[];
   count: number;
   usable_count: number;
   message: string;
+  diagnostics: CameraDiagnostics;
 };
 
 const API = import.meta.env.VITE_API_URL ?? "http://127.0.0.1:8000";
@@ -66,6 +86,7 @@ function App() {
   const [cameras, setCameras] = useState<CameraDevice[]>([]);
   const [selectedCamera, setSelectedCamera] = useState("");
   const [cameraScanMessage, setCameraScanMessage] = useState("Scanning Linux video devices…");
+  const [cameraDiagnostics, setCameraDiagnostics] = useState<CameraDiagnostics | null>(null);
   const [scanningCameras, setScanningCameras] = useState(false);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState("");
@@ -93,6 +114,7 @@ function App() {
         if (!active) return;
         setCameras(data.cameras ?? []);
         setCameraScanMessage(data.message ?? "Camera scan complete.");
+        setCameraDiagnostics(data.diagnostics ?? null);
         const preferred = data.cameras?.find((camera) => camera.openable);
         setSelectedCamera((current) => (
           current && data.cameras?.some((camera) => camera.device === current && camera.openable)
@@ -103,7 +125,9 @@ function App() {
       .catch((error) => {
         if (!active) return;
         setCameras([]);
+        setCameraDiagnostics(null);
         setCameraScanMessage(error instanceof Error ? error.message : "Could not discover cameras.");
+      setCameraDiagnostics(null);
       });
 
     return () => { active = false; };
@@ -184,7 +208,12 @@ function App() {
         { method: "POST" },
       );
       const result = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(result.detail ?? "Could not start camera.");
+      if (!response.ok) {
+        const detail = result.detail;
+        const message = typeof detail === "string" ? detail : detail?.message ?? "Could not start camera.";
+        if (detail?.diagnostics) setCameraDiagnostics(detail.diagnostics as CameraDiagnostics);
+        throw new Error(message);
+      }
       setSource("camera");
       setSelectedFile(null);
       setAnnotatedFrame("");
@@ -243,6 +272,7 @@ function App() {
       if (!response.ok) throw new Error(data.message ?? "Camera discovery failed.");
       setCameras(data.cameras ?? []);
       setCameraScanMessage(data.message ?? "Camera scan complete.");
+      setCameraDiagnostics(data.diagnostics ?? null);
       const preferred = data.cameras?.find((camera) => camera.openable);
       setSelectedCamera((current) => (
         current && data.cameras?.some((camera) => camera.device === current && camera.openable)
@@ -377,6 +407,18 @@ function App() {
                   <div className="camera-glyph">◉</div>
                   <strong>Camera feed is inactive</strong>
                   <span>{usableCameras.length ? `Selected device: ${selectedCamera}` : cameraScanMessage}</span>
+                  {cameraDiagnostics && (
+                    <div className="camera-diagnostics">
+                      <div>Backend user: <strong>{cameraDiagnostics.username}</strong> · video group: <strong>{cameraDiagnostics.video_group_member ? "member" : "not a member"}</strong></div>
+                      <div>Groups: {cameraDiagnostics.effective_groups.join(", ") || "none reported"}</div>
+                      <div>{cameraDiagnostics.recommendation}</div>
+                      {cameraDiagnostics.device_nodes.map((node) => (
+                        <div className="camera-diagnostic-node" key={node.device}>
+                          <strong>{node.device}</strong> · {node.name ?? node.device} · {node.owner}:{node.group} {node.mode} · {node.openable ? "capture OK" : node.error}
+                        </div>
+                      ))}
+                    </div>
+                  )}
                   {usableCameras.length > 0 ? (
                     <button className="primary-button" onClick={startCamera}>Start camera <span>→</span></button>
                   ) : (
