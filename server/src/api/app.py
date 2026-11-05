@@ -24,6 +24,19 @@ MODEL_PATH = Path(os.getenv("CUBIT_MODEL", str(DEFAULT_MODEL))).expanduser()
 DEVICE = os.getenv("CUBIT_DEVICE", "0" if torch.cuda.is_available() else "cpu")
 MAX_UPLOAD_BYTES = int(os.getenv("CUBIT_MAX_UPLOAD_MB", "100")) * 1024 * 1024
 
+# Keep inference from monopolizing every CPU core on desktop machines.
+def _positive_env_int(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.getenv(name, str(default))))
+    except ValueError:
+        return default
+
+
+TORCH_CPU_THREADS = min(os.cpu_count() or 1, _positive_env_int("CUBIT_TORCH_THREADS", 4))
+VIDEO_FRAME_STRIDE = _positive_env_int("CUBIT_VIDEO_FRAME_STRIDE", 2)
+torch.set_num_threads(TORCH_CPU_THREADS)
+cv2.setNumThreads(min(TORCH_CPU_THREADS, 2))
+
 app = FastAPI(title="CUBIT Inspect API", version="0.5.0")
 app.add_middleware(
     CORSMiddleware,
@@ -421,29 +434,57 @@ def _process_video_scan(job_id: str, input_path: Path, output_path: Path, conf: 
         class_counts: dict[str, int] = {"Crack": 0, "Spalling": 0, "Moisture": 0}
         confidence_sums: dict[str, float] = {"Crack": 0.0, "Spalling": 0.0, "Moisture": 0.0}
         total_detections = 0
-        _update_video_job(job_id, total_frames=total_frames, fps=round(fps, 2), frame_width=width, frame_height=height)
+        analysed_frames = 0
+        last_annotated: np.ndarray | None = None
+        _update_video_job(
+            job_id,
+            total_frames=total_frames,
+            fps=round(fps, 2),
+            frame_width=width,
+            frame_height=height,
+            frame_stride=VIDEO_FRAME_STRIDE,
+        )
 
         while True:
             ok, frame = capture.read()
             if not ok or frame is None:
                 break
-            with _model_lock:
-                result = model.predict(frame, imgsz=imgsz, conf=conf, device=DEVICE, verbose=False)[0]
-            if result.boxes is not None:
-                for box in result.boxes:
-                    class_id = int(box.cls.item())
-                    raw_class_name = str(result.names.get(class_id, f"Class {class_id}"))
-                    known_classes = {"crack": "Crack", "spalling": "Spalling", "moisture": "Moisture"}
-                    class_name = known_classes.get(raw_class_name.casefold(), raw_class_name)
-                    class_counts.setdefault(class_name, 0)
-                    confidence_sums.setdefault(class_name, 0.0)
-                    class_counts[class_name] += 1
-                    confidence_sums[class_name] += float(box.conf.item())
-                    total_detections += 1
-            writer.write(result.plot())
+
+            # Run YOLO on a configurable sample of frames; reuse the previous
+            # annotated frame between samples to preserve the output frame rate.
+            should_infer = processed_frames % VIDEO_FRAME_STRIDE == 0 or last_annotated is None
+            if should_infer:
+                with _model_lock:
+                    result = model.predict(
+                        frame,
+                        imgsz=imgsz,
+                        conf=conf,
+                        device=DEVICE,
+                        verbose=False,
+                    )[0]
+                if result.boxes is not None:
+                    for box in result.boxes:
+                        class_id = int(box.cls.item())
+                        raw_class_name = str(result.names.get(class_id, f"Class {class_id}"))
+                        known_classes = {"crack": "Crack", "spalling": "Spalling", "moisture": "Moisture"}
+                        class_name = known_classes.get(raw_class_name.casefold(), raw_class_name)
+                        class_counts.setdefault(class_name, 0)
+                        confidence_sums.setdefault(class_name, 0.0)
+                        class_counts[class_name] += 1
+                        confidence_sums[class_name] += float(box.conf.item())
+                        total_detections += 1
+                last_annotated = result.plot()
+                analysed_frames += 1
+
+            writer.write(last_annotated)
             processed_frames += 1
             progress = min(99, int(processed_frames * 100 / total_frames)) if total_frames > 0 else 0
-            _update_video_job(job_id, current_frame=processed_frames, progress=progress)
+            _update_video_job(
+                job_id,
+                current_frame=processed_frames,
+                analysed_frames=analysed_frames,
+                progress=progress,
+            )
 
         if processed_frames == 0:
             raise RuntimeError("The video contains no readable frames.")
@@ -461,6 +502,8 @@ def _process_video_scan(job_id: str, input_path: Path, output_path: Path, conf: 
             "class_counts": class_counts,
             "average_confidence_by_class": average_confidence,
             "processed_frames": processed_frames,
+            "analysed_frames": analysed_frames,
+            "frame_stride": VIDEO_FRAME_STRIDE,
             "total_frames": total_frames or processed_frames,
             "fps": round(fps, 2),
             "width": width,
