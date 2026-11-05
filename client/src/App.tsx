@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
+import "./VideoAnalysis.css";
 
 type Detection = {
   id: number;
@@ -33,6 +34,29 @@ type CameraDiscovery = {
   count: number;
   usable_count: number;
   message: string;
+};
+
+type VideoScanSummary = {
+  total_detections: number;
+  class_counts: Record<string, number>;
+  average_confidence_by_class: Record<string, number>;
+  processed_frames: number;
+  total_frames: number;
+  fps: number;
+  width: number;
+  height: number;
+  duration_seconds: number;
+};
+type VideoScanJob = {
+  job_id: string;
+  filename: string;
+  status: "queued" | "processing" | "completed" | "failed";
+  progress: number;
+  current_frame: number;
+  total_frames: number;
+  error: string | null;
+  summary: VideoScanSummary | null;
+  result_url: string | null;
 };
 
 const API = import.meta.env.VITE_API_URL ?? "http://127.0.0.1:8001";
@@ -71,6 +95,12 @@ function App() {
   const [previewUrl, setPreviewUrl] = useState("");
   const [annotatedFrame, setAnnotatedFrame] = useState("");
   const [busy, setBusy] = useState(false);
+  const [videoPhase, setVideoPhase] = useState<"idle" | "review" | "uploading" | "processing" | "completed" | "failed">("idle");
+  const [videoUploadProgress, setVideoUploadProgress] = useState(0);
+  const [videoScan, setVideoScan] = useState<VideoScanJob | null>(null);
+  const [videoError, setVideoError] = useState("");
+  const [videoAcknowledged, setVideoAcknowledged] = useState(false);
+  const videoTaskActiveRef = useRef(false);
   const cameraPollRef = useRef<number | null>(null);
 
   useEffect(() => {
@@ -116,6 +146,8 @@ function App() {
       void fetch(`${API}/api/camera/stop`, { method: "POST" }).catch(() => undefined);
     };
   }, []);
+
+  useEffect(() => () => { videoTaskActiveRef.current = false; }, []);
 
   useEffect(() => {
     if (!previewUrl) return;
@@ -203,10 +235,16 @@ function App() {
     if (previewUrl) URL.revokeObjectURL(previewUrl);
     setSelectedFile(file);
     setPreviewUrl(URL.createObjectURL(file));
-    setSource(file.type.startsWith("video/") ? "video" : "image");
+    const isVideo = file.type.startsWith("video/") || /\.(mp4|mov|m4v|avi|mkv|webm|mpg|mpeg)$/i.test(file.name);
+    setSource(isVideo ? "video" : "image");
     setAnnotatedFrame("");
     setDetections([]);
     setCameraError("");
+    setVideoScan(null);
+    setVideoUploadProgress(0);
+    setVideoError("");
+    setVideoAcknowledged(false);
+    setVideoPhase(isVideo ? "review" : "idle");
   }
 
   async function inspectImage() {
@@ -234,6 +272,82 @@ function App() {
     }
   }
 
+
+  async function startVideoScan() {
+    if (!selectedFile || source !== "video") return;
+
+    setVideoPhase("uploading");
+    setVideoUploadProgress(0);
+    setVideoScan(null);
+    setVideoError("");
+    setVideoAcknowledged(false);
+    setCameraError("");
+    videoTaskActiveRef.current = true;
+
+    try {
+      const form = new FormData();
+      form.append("file", selectedFile);
+
+      const job = await new Promise<{ job_id: string }>((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open("POST", API + "/api/infer/video?conf=" + confidence + "&imgsz=" + imgsz);
+        xhr.upload.onprogress = (event) => {
+          if (event.lengthComputable) {
+            setVideoUploadProgress(Math.round((event.loaded / event.total) * 100));
+          }
+        };
+        xhr.onload = () => {
+          let payload: { job_id?: string; detail?: string } = {};
+          try {
+            payload = JSON.parse(xhr.responseText || "{}");
+          } catch {
+            reject(new Error("The video service returned an unreadable response."));
+            return;
+          }
+          if (xhr.status < 200 || xhr.status >= 300 || !payload.job_id) {
+            reject(new Error(payload.detail ?? "Could not upload the video."));
+            return;
+          }
+          setVideoUploadProgress(100);
+          resolve({ job_id: payload.job_id });
+        };
+        xhr.onerror = () => reject(new Error("Video upload failed. Check that the inference service is reachable."));
+        xhr.onabort = () => reject(new Error("Video upload was cancelled."));
+        xhr.send(form);
+      });
+
+      setVideoPhase("processing");
+      while (videoTaskActiveRef.current) {
+        const response = await fetch(API + "/api/infer/video/" + job.job_id);
+        const status = await response.json().catch(() => ({})) as VideoScanJob & { detail?: string };
+        if (!response.ok) throw new Error(status.detail ?? "Could not read video scan progress.");
+
+        setVideoScan(status);
+        if (status.status === "completed") {
+          setVideoPhase("completed");
+          return;
+        }
+        if (status.status === "failed") {
+          throw new Error(status.error ?? "Video processing failed.");
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, 600));
+      }
+    } catch (error) {
+      setVideoError(error instanceof Error ? error.message : "Video scan failed.");
+      setVideoPhase("failed");
+    }
+  }
+
+  function resetVideoScan() {
+    setVideoScan(null);
+    setVideoUploadProgress(0);
+    setVideoError("");
+    setVideoAcknowledged(false);
+    videoTaskActiveRef.current = false;
+    setVideoPhase("review");
+  }
+
+
   async function refreshCameras() {
     setScanningCameras(true);
     setCameraError("");
@@ -257,6 +371,13 @@ function App() {
   }
 
   const usableCameras = cameras.filter((camera) => camera.openable);
+
+  const videoSummary = source === "video" && videoPhase === "completed" ? videoScan?.summary : null;
+  const displayCounts = videoSummary ? {
+    crack: videoSummary.class_counts.Crack ?? 0,
+    spalling: videoSummary.class_counts.Spalling ?? 0,
+    moisture: videoSummary.class_counts.Moisture ?? 0,
+  } : counts;
 
   const engineLabel = health?.model_exists
     ? health.model_loaded ? "Model loaded" : "Checkpoint found"
@@ -319,17 +440,17 @@ function App() {
         </section>
 
         <section className="metrics-grid">
-          <Metric label="DETECTIONS" value={String(detections.length).padStart(2, "0")} note="Current frame" icon="⌗" />
-          <Metric label="CRACKS" value={String(counts.crack).padStart(2, "0")} note="Class 0 · Crack" icon="⌁" />
-          <Metric label="SPALLING" value={String(counts.spalling).padStart(2, "0")} note="Class 1 · Spalling" icon="▱" />
-          <Metric label="MOISTURE" value={String(counts.moisture).padStart(2, "0")} note="Class 2 · Moisture" icon="◌" />
+          <Metric label="DETECTIONS" value={String(videoSummary ? videoSummary.total_detections : detections.length).padStart(2, "0")} note={videoSummary ? "Video observations" : "Current frame"} icon="⌗" />
+          <Metric label="CRACKS" value={String(displayCounts.crack).padStart(2, "0")} note="Class 0 · Crack" icon="⌁" />
+          <Metric label="SPALLING" value={String(displayCounts.spalling).padStart(2, "0")} note="Class 1 · Spalling" icon="▱" />
+          <Metric label="MOISTURE" value={String(displayCounts.moisture).padStart(2, "0")} note="Class 2 · Moisture" icon="◌" />
         </section>
 
         <div className="content-grid">
           <section className="panel inspection-panel">
             <div className="panel-header">
               <div><h2>Inspection feed</h2><p>Live camera or local media input</p></div>
-              <span className="feed-tag"><i className={cameraOn ? "status-dot online" : "status-dot"} /> {cameraOn ? "LIVE" : "STANDBY"}</span>
+              <span className="feed-tag"><i className={cameraOn || videoPhase === "processing" ? "status-dot online" : "status-dot"} /> {cameraOn ? "LIVE" : videoPhase === "processing" || videoPhase === "uploading" ? "SCANNING" : videoPhase === "completed" ? "SCAN COMPLETE" : "STANDBY"}</span>
             </div>
             <div className="feed-toolbar">
               <div className="tabs">
@@ -371,7 +492,13 @@ function App() {
               {source !== "camera" && previewUrl && source === "image" && (
                 <img className="media-preview" src={annotatedFrame || previewUrl} alt="Inspection result" />
               )}
-              {source === "video" && previewUrl && <video className="media-preview" src={previewUrl} controls />}
+              {source === "video" && previewUrl && (
+                <video
+                  className="media-preview"
+                  src={videoPhase === "completed" && videoScan?.result_url ? API + videoScan.result_url : previewUrl}
+                  controls
+                />
+              )}
               {source === "camera" && !cameraOn && (
                 <div className="empty-feed">
                   <div className="camera-glyph">◉</div>
@@ -398,8 +525,8 @@ function App() {
                 <label className="empty-feed upload-zone">
                   <div className="camera-glyph">▷</div>
                   <strong>Choose a video</strong>
-                  <span>Video playback is available; video inference is a next increment.</span>
-                  <input type="file" accept="video/*" onChange={(event) => chooseFile(event.target.files?.[0])} />
+                  <span>Upload MP4, MOV, AVI, MKV or WebM for defect detection.</span>
+                  <input type="file" accept="video/mp4,video/quicktime,video/x-msvideo,video/x-matroska,video/webm,.m4v,.mpg,.mpeg" onChange={(event) => chooseFile(event.target.files?.[0])} />
                 </label>
               )}
               {cameraError && <div className="error-banner">{cameraError}</div>}
@@ -419,6 +546,92 @@ function App() {
                 {source === "image" && <button className="primary-button" disabled={!selectedFile || busy} onClick={inspectImage}>{busy ? "Analysing…" : "Run analysis →"}</button>}
               </div>
             </div>
+
+                {source === "video" && selectedFile && (
+                  <section className="video-workflow" aria-live="polite">
+                    {videoPhase === "review" && (
+                      <div className="video-review">
+                        <div className="video-review-copy">
+                          <span className="video-kicker">READY FOR REVIEW</span>
+                          <h3>Confirm video scan</h3>
+                          <p>Check the selected footage and detection settings before running inference.</p>
+                        </div>
+                        <div className="video-file-facts">
+                          <div><span>FILE</span><strong>{selectedFile.name}</strong></div>
+                          <div><span>SIZE</span><strong>{(selectedFile.size / (1024 * 1024)).toFixed(1)} MB</strong></div>
+                          <div><span>CONFIDENCE</span><strong>{confidence.toFixed(2)}</strong></div>
+                          <div><span>RESOLUTION</span><strong>{imgsz} px</strong></div>
+                        </div>
+                        <div className="video-review-actions">
+                          <span>Processing runs locally on this device.</span>
+                          <button className="primary-button" onClick={startVideoScan}>Confirm & start scan <span>→</span></button>
+                        </div>
+                      </div>
+                    )}
+
+                    {(videoPhase === "uploading" || videoPhase === "processing") && (
+                      <div className="video-progress-card">
+                        <div className="video-progress-heading">
+                          <div>
+                            <span className="video-kicker">{videoPhase === "uploading" ? "STEP 1 OF 2" : "STEP 2 OF 2"}</span>
+                            <h3>{videoPhase === "uploading" ? "Uploading video" : "Analysing video frames"}</h3>
+                          </div>
+                          <strong>{videoPhase === "uploading" ? videoUploadProgress : videoScan?.progress ?? 0}%</strong>
+                        </div>
+                        <div
+                          className="video-progress-track"
+                          role="progressbar"
+                          aria-label={videoPhase === "uploading" ? "Video upload progress" : "Video processing progress"}
+                          aria-valuemin={0}
+                          aria-valuemax={100}
+                          aria-valuenow={videoPhase === "uploading" ? videoUploadProgress : videoScan?.progress ?? 0}
+                        >
+                          <span style={{ width: (videoPhase === "uploading" ? videoUploadProgress : videoScan?.progress ?? 0) + "%" }} />
+                        </div>
+                        <div className="video-progress-meta">
+                          <span>{videoPhase === "uploading" ? "Transferring file to the local inference service…" : videoScan?.status === "queued" ? "Waiting for the inference worker…" : "Running YOLO detection on each frame…"}</span>
+                          {videoPhase === "processing" && videoScan?.total_frames > 0 && (
+                            <strong>{videoScan.current_frame.toLocaleString()} / {videoScan.total_frames.toLocaleString()} frames</strong>
+                          )}
+                        </div>
+                        <p className="video-processing-note">Keep CUBIT Inspect open while the scan is running.</p>
+                      </div>
+                    )}
+
+                    {videoPhase === "completed" && videoScan?.summary && (
+                      <div className="video-complete-card">
+                        <div className="video-complete-heading">
+                          <span className="video-complete-icon">✓</span>
+                          <div><span className="video-kicker">PROCESSING COMPLETE</span><h3>Video scan finished</h3></div>
+                        </div>
+                        <div className="video-result-stats">
+                          <div><strong>{videoScan.summary.total_detections.toLocaleString()}</strong><span>Defect observations</span></div>
+                          <div><strong>{videoScan.summary.processed_frames.toLocaleString()}</strong><span>Frames analysed</span></div>
+                          <div><strong>{videoScan.summary.duration_seconds.toFixed(1)}s</strong><span>Video duration</span></div>
+                        </div>
+                        <p>Annotated video is ready. Review the results above, then confirm the scan.</p>
+                        {videoAcknowledged ? (
+                          <div className="video-acknowledged"><span>✓</span> Scan results confirmed for this session.</div>
+                        ) : (
+                          <div className="video-review-actions">
+                            <span>Confirmation does not export or permanently save this scan.</span>
+                            <button className="primary-button" onClick={() => setVideoAcknowledged(true)}>Confirm scan results <span>✓</span></button>
+                          </div>
+                        )}
+                        <button className="video-secondary-action" onClick={resetVideoScan}>Run another scan</button>
+                      </div>
+                    )}
+
+                    {videoPhase === "failed" && (
+                      <div className="video-failed-card">
+                        <span className="video-failed-icon">!</span>
+                        <div><span className="video-kicker">SCAN FAILED</span><h3>Video could not be processed</h3><p>{videoError}</p></div>
+                        <button className="secondary-button" onClick={resetVideoScan}>Try again</button>
+                      </div>
+                    )}
+                  </section>
+                )}
+
           </section>
 
           <aside className="right-column">
@@ -451,7 +664,22 @@ function App() {
                 <div><h2>Detected objects</h2><p>{detections.length} objects in current frame</p></div>
                 <button className="more-button" aria-label="More options">···</button>
               </div>
-              {detections.length ? (
+              {source === "video" && videoSummary ? (
+                <div className="detection-list video-detection-summary">
+                  {["Crack", "Spalling", "Moisture"].map((label) => (
+                    <div className="detection-item" key={label}>
+                      <span className="class-indicator" style={{ background: colorFor(label) }} />
+                      <div className="detection-name">
+                        <strong>{label}</strong>
+                        <small>{(videoSummary.average_confidence_by_class[label] ?? 0) > 0
+                          ? "Average confidence · " + ((videoSummary.average_confidence_by_class[label] ?? 0) * 100).toFixed(1) + "%"
+                          : "No observations"}</small>
+                      </div>
+                      <strong className="confidence-value">{(videoSummary.class_counts[label] ?? 0).toLocaleString()}</strong>
+                    </div>
+                  ))}
+                </div>
+              ) : detections.length ? (
                 <div className="detection-list">
                   {detections.map((item) => (
                     <div className="detection-item" key={item.id}>
