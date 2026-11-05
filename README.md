@@ -28,8 +28,10 @@ pnpm install
 pnpm tauri dev
 ```
 
-## Camera pipeline
+## Linux camera pipeline
 
-Camera capture is handled directly by Python/OpenCV through the Linux V4L2 interface. YOLO runs in the same local inference service, and the annotated frames are rendered by the Tauri React client using an MJPEG stream. Browser `getUserMedia` permissions are not used.
+The API discovers actual `/dev/videoN` nodes and tests which ones can return a frame. Select a usable device in the Camera control in the desktop app. It does not assume camera index 0 and does not use browser camera permissions.
+
+For diagnostics, run `ls -l /dev/video*` and `groups`. If the video device belongs to group `video` and your user is not in that group, add the user with `sudo usermod -aG video $USER`, then log out and back in. See `server/README.md` for the full API and camera troubleshooting details.
 
 The model checkpoint, datasets, run outputs, and private captures are not stored in Git.
