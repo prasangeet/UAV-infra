@@ -46,12 +46,12 @@ function App() {
   const [confidence, setConfidence] = useState(0.25);
   const [imgsz, setImgsz] = useState(1024);
   const [fps, setFps] = useState(0);
+  const [cameraStreamKey, setCameraStreamKey] = useState(0);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState("");
   const [annotatedFrame, setAnnotatedFrame] = useState("");
   const [busy, setBusy] = useState(false);
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const streamRef = useRef<MediaStream | null>(null);
+  const cameraPollRef = useRef<number | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -66,56 +66,45 @@ function App() {
   }, []);
 
   useEffect(() => () => {
-    streamRef.current?.getTracks().forEach((track) => track.stop());
     if (previewUrl) URL.revokeObjectURL(previewUrl);
+    if (cameraPollRef.current !== null) window.clearTimeout(cameraPollRef.current);
+    void fetch(`${API}/api/camera/stop`, { method: "POST" }).catch(() => undefined);
   }, [previewUrl]);
 
   useEffect(() => {
     if (!cameraOn || source !== "camera") return;
     let cancelled = false;
-    let timer = 0;
 
-    const processNextFrame = async () => {
-      if (cancelled) return;
-      const video = videoRef.current;
-      if (video && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth > 0) {
-        try {
-          const canvas = document.createElement("canvas");
-          canvas.width = video.videoWidth;
-          canvas.height = video.videoHeight;
-          const context = canvas.getContext("2d");
-          if (!context) throw new Error("Could not access camera frame.");
-          context.drawImage(video, 0, 0, canvas.width, canvas.height);
-          const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.82));
-          if (!blob) throw new Error("Could not encode camera frame.");
-
-          const form = new FormData();
-          form.append("file", blob, "camera-frame.jpg");
-          const startedAt = performance.now();
-          const response = await fetch(`${API}/api/infer/frame?conf=${confidence}&imgsz=${imgsz}`, {
-            method: "POST",
-            body: form,
-          });
-          if (!response.ok) {
-            const failure = await response.json().catch(() => ({}));
-            throw new Error(failure.detail ?? "Frame inference failed.");
-          }
-          const result: InferenceResult = await response.json();
-          if (cancelled) return;
-          setAnnotatedFrame(`data:image/jpeg;base64,${result.image}`);
-          setDetections(mapDetections(result.detections ?? []));
-          setFps(Math.max(1, Math.round(1000 / (performance.now() - startedAt))));
-          setCameraError("");
-        } catch (error) {
-          if (!cancelled) setCameraError(error instanceof Error ? error.message : "Live inference failed.");
+    const pollStatus = async () => {
+      try {
+        const response = await fetch(`${API}/api/camera/status`);
+        if (!response.ok) throw new Error("Could not read camera status.");
+        const status = await response.json();
+        if (cancelled) return;
+        setDetections(mapDetections((status.detections ?? []).map((item: { class_name: string; confidence: number }) => ({
+          class_name: item.class_name,
+          confidence: item.confidence,
+        }))));
+        setFps(Math.round(status.fps ?? 0));
+        if (status.error) setCameraError(status.error);
+        if (!status.running) {
+          setCameraOn(false);
+          setFps(0);
+          if (status.error) setCameraError(status.error);
+          return;
         }
+      } catch (error) {
+        if (!cancelled) setCameraError(error instanceof Error ? error.message : "Camera status unavailable.");
       }
-      if (!cancelled) timer = window.setTimeout(processNextFrame, 100);
+      if (!cancelled) cameraPollRef.current = window.setTimeout(pollStatus, 350);
     };
 
-    void processNextFrame();
-    return () => { cancelled = true; window.clearTimeout(timer); };
-  }, [cameraOn, source, confidence, imgsz]);
+    void pollStatus();
+    return () => {
+      cancelled = true;
+      if (cameraPollRef.current !== null) window.clearTimeout(cameraPollRef.current);
+    };
+  }, [cameraOn, source]);
 
   const counts = useMemo(() => ({
     crack: detections.filter((item) => item.label.toLowerCase() === "crack").length,
@@ -123,9 +112,12 @@ function App() {
     moisture: detections.filter((item) => item.label.toLowerCase() === "moisture").length,
   }), [detections]);
 
-  function stopCamera() {
-    streamRef.current?.getTracks().forEach((track) => track.stop());
-    streamRef.current = null;
+  async function stopCamera() {
+    try {
+      await fetch(`${API}/api/camera/stop`, { method: "POST" });
+    } catch {
+      // The backend may already be stopped; the UI should still reset.
+    }
     setCameraOn(false);
     setFps(0);
   }
@@ -133,24 +125,20 @@ function App() {
   async function startCamera() {
     try {
       setCameraError("");
-      if (!navigator.mediaDevices?.getUserMedia) {
-        throw new Error("Camera access is unavailable in this WebView.");
-      }
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 1280 }, height: { ideal: 720 } },
-        audio: false,
+      const response = await fetch(`${API}/api/camera/start?index=0&conf=${confidence}&imgsz=${imgsz}`, {
+        method: "POST",
       });
-      streamRef.current = stream;
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(result.detail ?? "Could not start camera.");
       setSource("camera");
       setSelectedFile(null);
       setAnnotatedFrame("");
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        await videoRef.current.play();
-      }
+      setDetections([]);
+      setCameraStreamKey((key) => key + 1);
       setCameraOn(true);
     } catch (error) {
-      setCameraError(error instanceof Error ? error.message : "Unable to access camera.");
+      setCameraOn(false);
+      setCameraError(error instanceof Error ? error.message : "Unable to start native camera capture.");
     }
   }
 
@@ -273,9 +261,12 @@ function App() {
               {cameraOn && <span className="fps-counter">{fps || "—"} FPS</span>}
             </div>
             <div className="feed-stage">
-              <video ref={videoRef} className={cameraOn && source === "camera" && !annotatedFrame ? "camera-source visible" : "camera-source"} muted playsInline />
-              {cameraOn && source === "camera" && annotatedFrame && (
-                <img className="annotated-preview" src={annotatedFrame} alt="Live annotated detection frame" />
+              {cameraOn && source === "camera" && (
+                <img
+                  className="annotated-preview"
+                  src={`${API}/api/camera/stream?session=${cameraStreamKey}`}
+                  alt="Live camera stream with YOLO detections"
+                />
               )}
               {source !== "camera" && previewUrl && source === "image" && (
                 <img className="media-preview" src={annotatedFrame || previewUrl} alt="Inspection result" />
