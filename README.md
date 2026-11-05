@@ -28,10 +28,17 @@ pnpm install
 pnpm tauri dev
 ```
 
-## Linux camera pipeline
+## Linux camera access
 
-The API discovers actual `/dev/videoN` nodes and tests which ones can return a frame. Select a usable device in the Camera control in the desktop app. It does not assume camera index 0 and does not use browser camera permissions.
+The desktop app does not use a browser permission prompt. The Python/OpenCV service opens Linux V4L2 devices as the current user. The camera selector probes `/dev/videoN` nodes and shows device ownership, group/mode, backend group membership, and OpenCV capture errors.
 
-For diagnostics, run `ls -l /dev/video*` and `groups`. If the video device belongs to group `video` and your user is not in that group, add the user with `sudo usermod -aG video $USER`, then log out and back in. See `server/README.md` for the full API and camera troubleshooting details.
+To run the guided permission check/setup:
+
+```fish
+cd server
+bash scripts/setup_camera_access.sh
+```
+
+It asks before adding your account to the `video` group and never makes camera nodes world-writable. If group membership changes, fully log out and back into your desktop session before restarting the API. Full details are in `server/README.md`.
 
 The model checkpoint, datasets, run outputs, and private captures are not stored in Git.
