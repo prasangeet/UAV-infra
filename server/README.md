@@ -30,6 +30,23 @@ Endpoints:
 
 The Tauri WebView never calls browser `getUserMedia`. Python/OpenCV owns the V4L2 device, YOLO performs inference on the configured CUDA device, and React displays the MJPEG stream.
 
+
+## Video processing and resource limits
+
+Video scans run asynchronously so frame inference does not block the FastAPI event loop. The API exposes upload, job-status, and annotated-result endpoints:
+
+- \`POST /api/infer/video?conf=0.25&imgsz=1024\` — upload a video and receive a job ID.
+- \`GET /api/infer/video/{job_id}\` — read upload/processing status and frame progress.
+- \`GET /api/infer/video/{job_id}/result\` — retrieve the annotated MP4 after completion.
+
+Inference runs on every second frame by default to reduce sustained CPU/GPU load while preserving the output video's frame rate. The most recent annotated frame is held between inference samples. Tune this with:
+
+- \`CUBIT_VIDEO_FRAME_STRIDE=1\` — infer every frame (highest load).
+- \`CUBIT_VIDEO_FRAME_STRIDE=2\` — infer every second frame (default).
+- \`CUBIT_TORCH_THREADS=4\` — limit PyTorch CPU intra-op threads (default 4).
+
+The image inference endpoint also sends decoding, model initialization, prediction, and annotation to a worker thread rather than blocking the ASGI event loop.
+
 ## Troubleshooting
 
 Inspect device nodes and the current user's groups:
