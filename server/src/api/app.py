@@ -21,7 +21,7 @@ MODEL_PATH = Path(os.getenv("CUBIT_MODEL", str(DEFAULT_MODEL))).expanduser()
 DEVICE = os.getenv("CUBIT_DEVICE", "0" if torch.cuda.is_available() else "cpu")
 MAX_UPLOAD_BYTES = int(os.getenv("CUBIT_MAX_UPLOAD_MB", "100")) * 1024 * 1024
 
-app = FastAPI(title="CUBIT Inspect API", version="0.4.0")
+app = FastAPI(title="CUBIT Inspect API", version="0.5.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -63,6 +63,102 @@ def get_model() -> YOLO:
     return _model
 
 
+def camera_device_nodes() -> list[Path]:
+    """Return Linux V4L2 video nodes instead of assuming an OpenCV numeric index."""
+    return sorted(
+        (path for path in Path("/dev").glob("video[0-9]*") if path.exists()),
+        key=lambda path: int(path.name.removeprefix("video")),
+    )
+
+
+def camera_name(device: Path) -> str:
+    sysfs_name = Path("/sys/class/video4linux") / device.name / "name"
+    try:
+        return sysfs_name.read_text(encoding="utf-8").strip() or device.name
+    except OSError:
+        return device.name
+
+
+def inspect_camera(device: Path) -> dict[str, Any]:
+    """Probe a V4L2 node and report why it cannot be used."""
+    readable = os.access(device, os.R_OK)
+    writable = os.access(device, os.W_OK)
+    result: dict[str, Any] = {
+        "device": str(device),
+        "name": camera_name(device),
+        "readable": readable,
+        "writable": writable,
+        "openable": False,
+        "error": None,
+    }
+
+    if not readable or not writable:
+        result["error"] = (
+            f"No read/write permission for {device}. Check its owner/group and add your user "
+            "to the device group (usually 'video'), then log out and back in."
+        )
+        return result
+
+    capture = cv2.VideoCapture(str(device), cv2.CAP_V4L2)
+    if not capture.isOpened():
+        capture.release()
+        capture = cv2.VideoCapture(str(device), cv2.CAP_ANY)
+
+    if not capture.isOpened():
+        capture.release()
+        result["error"] = (
+            f"OpenCV could not open {device}. It may be a metadata-only node, already in use, "
+            "or unsupported by the installed OpenCV video backend."
+        )
+        return result
+
+    capture.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    ok, frame = capture.read()
+    capture.release()
+
+    if not ok or frame is None:
+        result["error"] = (
+            f"OpenCV opened {device}, but it did not return an image frame. "
+            "This may be a non-capture node or a camera format/backend issue."
+        )
+        return result
+
+    result["openable"] = True
+    result["width"] = int(frame.shape[1])
+    result["height"] = int(frame.shape[0])
+    result["error"] = None
+    return result
+
+
+@app.get("/api/cameras")
+def list_cameras() -> dict[str, Any]:
+    """Discover and probe every Linux /dev/video* node for actual frame capture."""
+    nodes = camera_device_nodes()
+    cameras = [inspect_camera(node) for node in nodes]
+    usable = [item for item in cameras if item["openable"]]
+
+    if not nodes:
+        message = (
+            "No /dev/video* devices exist. Check that the webcam is connected and detected "
+            "by Linux. Inspect v4l2-ctl --list-devices and ls -l /dev/video*."
+        )
+    elif not usable:
+        details = "; ".join(
+            f'{item["device"]}: {item["error"]}' for item in cameras if item["error"]
+        )
+        message = f"Found {len(nodes)} video device node(s), but none can capture frames. {details}"
+    else:
+        message = f"Found {len(usable)} usable camera capture device(s)."
+
+    return {
+        "cameras": cameras,
+        "count": len(cameras),
+        "usable_count": len(usable),
+        "message": message,
+    }
+
+
 class CameraWorker:
     """Captures frames with OpenCV and runs YOLO outside the Tauri WebView."""
 
@@ -78,27 +174,38 @@ class CameraWorker:
         self._detections: list[dict[str, Any]] = []
         self._fps = 0.0
         self._error: str | None = None
-        self._camera_index = 0
+        self._camera_device: str | None = None
         self._frame_size = (0, 0)
 
-    def start(self, index: int, conf: float, imgsz: int) -> None:
+    def start(self, device: str, conf: float, imgsz: int) -> None:
+        allowed_devices = {str(path) for path in camera_device_nodes()}
+        if device not in allowed_devices:
+            raise RuntimeError(
+                f"{device!r} is not a discovered /dev/video* device. Refresh the camera list and select a device."
+            )
+
         with self._lifecycle_lock:
             with self._state_lock:
                 if self._thread is not None and self._thread.is_alive():
                     if self._running:
-                        raise RuntimeError("Camera is already running.")
-                    raise RuntimeError("Camera worker is still shutting down. Try again shortly.")
+                        raise RuntimeError("A camera is already running. Stop it before switching devices.")
+                    raise RuntimeError("The camera worker is still shutting down. Try again shortly.")
 
-            capture = cv2.VideoCapture(index, cv2.CAP_V4L2)
+            device_path = Path(device)
+            if not os.access(device_path, os.R_OK | os.W_OK):
+                raise RuntimeError(
+                    f"Permission denied for {device}. Check device permissions and your Linux groups. "
+                    "Your user may need video-group access followed by a full log out and log in."
+                )
+
+            capture = cv2.VideoCapture(device, cv2.CAP_V4L2)
             if not capture.isOpened():
                 capture.release()
-                capture = cv2.VideoCapture(index)
+                capture = cv2.VideoCapture(device, cv2.CAP_ANY)
             if not capture.isOpened():
                 capture.release()
                 raise RuntimeError(
-                    f"Could not open camera {index} (/dev/video{index}). "
-                    "Check that the device exists and your user can access it. "
-                    "On Linux, inspect /dev/video* permissions and your video group membership."
+                    f"Could not open {device}. It may be busy, a metadata-only node, or unsupported."
                 )
 
             capture.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
@@ -107,7 +214,7 @@ class CameraWorker:
 
             with self._state_lock:
                 self._capture = capture
-                self._camera_index = index
+                self._camera_device = device
                 self._frame_size = (0, 0)
                 self._latest_jpeg = None
                 self._frame_sequence = 0
@@ -132,7 +239,7 @@ class CameraWorker:
                 if not ok or frame is None:
                     if not self._stop_event.is_set():
                         with self._state_lock:
-                            self._error = "OpenCV could not read a frame from the camera."
+                            self._error = f"OpenCV opened {self._camera_device}, but could not read a frame."
                     break
 
                 with _model_lock:
@@ -215,7 +322,7 @@ class CameraWorker:
         with self._state_lock:
             return {
                 "running": self._running,
-                "camera_index": self._camera_index,
+                "camera_device": self._camera_device,
                 "fps": round(self._fps, 1),
                 "detections": list(self._detections),
                 "error": self._error,
@@ -279,13 +386,13 @@ def model_info() -> dict[str, Any]:
 
 @app.post("/api/camera/start")
 def start_camera(
-    index: int = Query(0, ge=0, le=15),
+    device: str = Query(..., min_length=1),
     conf: float = Query(0.25, ge=0.0, le=1.0),
     imgsz: int = Query(1024, ge=32, le=2048),
 ) -> dict[str, Any]:
     get_model()
     try:
-        camera.start(index, conf, imgsz)
+        camera.start(device, conf, imgsz)
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {"status": "starting", **camera.status()}
