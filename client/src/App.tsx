@@ -378,6 +378,7 @@ function App() {
     spalling: videoSummary.class_counts.Spalling ?? 0,
     moisture: videoSummary.class_counts.Moisture ?? 0,
   } : counts;
+  const videoProgress = videoPhase === "uploading" ? videoUploadProgress : (videoScan?.progress ?? 0);
 
   const engineLabel = health?.model_exists
     ? health.model_loaded ? "Model loaded" : "Checkpoint found"
@@ -576,7 +577,7 @@ function App() {
                             <span className="video-kicker">{videoPhase === "uploading" ? "STEP 1 OF 2" : "STEP 2 OF 2"}</span>
                             <h3>{videoPhase === "uploading" ? "Uploading video" : "Analysing video frames"}</h3>
                           </div>
-                          <strong>{videoPhase === "uploading" ? videoUploadProgress : videoScan?.progress ?? 0}%</strong>
+                          <strong>{videoProgress}%</strong>
                         </div>
                         <div
                           className="video-progress-track"
@@ -584,9 +585,9 @@ function App() {
                           aria-label={videoPhase === "uploading" ? "Video upload progress" : "Video processing progress"}
                           aria-valuemin={0}
                           aria-valuemax={100}
-                          aria-valuenow={videoPhase === "uploading" ? videoUploadProgress : videoScan?.progress ?? 0}
+                          aria-valuenow={videoProgress}
                         >
-                          <span style={{ width: (videoPhase === "uploading" ? videoUploadProgress : videoScan?.progress ?? 0) + "%" }} />
+                          <span style={{ width: (videoProgress) + "%" }} />
                         </div>
                         <div className="video-progress-meta">
                           <span>{videoPhase === "uploading" ? "Transferring file to the local inference service…" : videoScan?.status === "queued" ? "Waiting for the inference worker…" : "Running YOLO detection on each frame…"}</span>
