@@ -100,6 +100,7 @@ function App() {
   const [videoScan, setVideoScan] = useState<VideoScanJob | null>(null);
   const [videoError, setVideoError] = useState("");
   const [videoAcknowledged, setVideoAcknowledged] = useState(false);
+  const [showVideoPreview, setShowVideoPreview] = useState(false);
   const videoTaskActiveRef = useRef(false);
   const cameraPollRef = useRef<number | null>(null);
 
@@ -244,6 +245,7 @@ function App() {
     setVideoUploadProgress(0);
     setVideoError("");
     setVideoAcknowledged(false);
+    setShowVideoPreview(false);
     setVideoPhase(isVideo ? "review" : "idle");
   }
 
@@ -324,6 +326,7 @@ function App() {
 
         setVideoScan(status);
         if (status.status === "completed") {
+          setShowVideoPreview(false);
           setVideoPhase("completed");
           return;
         }
@@ -343,6 +346,7 @@ function App() {
     setVideoUploadProgress(0);
     setVideoError("");
     setVideoAcknowledged(false);
+    setShowVideoPreview(false);
     videoTaskActiveRef.current = false;
     setVideoPhase("review");
   }
@@ -494,11 +498,36 @@ function App() {
                 <img className="media-preview" src={annotatedFrame || previewUrl} alt="Inspection result" />
               )}
               {source === "video" && previewUrl && (
-                <video
-                  className="media-preview"
-                  src={videoPhase === "completed" && videoScan?.result_url ? API + videoScan.result_url : previewUrl}
-                  controls
-                />
+                <div className="video-preview-shell">
+                  {showVideoPreview ? (
+                    <video
+                      className="media-preview"
+                      src={videoPhase === "completed" && videoScan?.result_url ? API + videoScan.result_url : previewUrl}
+                      controls
+                      preload="metadata"
+                      playsInline
+                    />
+                  ) : (
+                    <div className="video-preview-prompt">
+                      <span className="video-preview-symbol">▷</span>
+                      <span className="video-kicker">
+                        {videoPhase === "completed" ? "ANNOTATED VIDEO READY" : "VIDEO SELECTED"}
+                      </span>
+                      <strong>{selectedFile?.name ?? "Selected video"}</strong>
+                      <p>
+                        {videoPhase === "completed"
+                          ? "The processed output is ready. Preview it when you need playback."
+                          : "Playback is deferred to keep the desktop WebView responsive while selecting and processing footage."}
+                      </p>
+                      <button
+                        className="secondary-button"
+                        onClick={() => setShowVideoPreview(true)}
+                      >
+                        {videoPhase === "completed" ? "Preview annotated video" : "Preview source video"}
+                      </button>
+                    </div>
+                  )}
+                </div>
               )}
               {source === "camera" && !cameraOn && (
                 <div className="empty-feed">
