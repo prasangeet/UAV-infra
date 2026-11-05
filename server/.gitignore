@@ -12,3 +12,8 @@ wheels/
 data
 reports
 runs
+
+# Local configuration (keep the example file tracked)
+.env
+.env.*
+!.env.example
