@@ -50,7 +50,7 @@ type VideoScanSummary = {
 type VideoScanJob = {
   job_id: string;
   filename: string;
-  status: "queued" | "processing" | "completed" | "failed";
+  status: "queued" | "loading_model" | "processing" | "completed" | "failed";
   progress: number;
   current_frame: number;
   total_frames: number;
@@ -604,7 +604,7 @@ function App() {
                         <div className="video-progress-heading">
                           <div>
                             <span className="video-kicker">{videoPhase === "uploading" ? "STEP 1 OF 2" : "STEP 2 OF 2"}</span>
-                            <h3>{videoPhase === "uploading" ? "Uploading video" : "Analysing video frames"}</h3>
+                            <h3>{videoPhase === "uploading" ? "Uploading video" : videoScan?.status === "loading_model" ? "Preparing detection model" : "Analysing video frames"}</h3>
                           </div>
                           <strong>{videoProgress}%</strong>
                         </div>
@@ -619,7 +619,7 @@ function App() {
                           <span style={{ width: (videoProgress) + "%" }} />
                         </div>
                         <div className="video-progress-meta">
-                          <span>{videoPhase === "uploading" ? "Transferring file to the local inference service…" : videoScan?.status === "queued" ? "Waiting for the inference worker…" : "Running YOLO detection on each frame…"}</span>
+                          <span>{videoPhase === "uploading" ? "Transferring file to the local inference service…" : videoScan?.status === "queued" ? "Waiting for the inference worker…" : videoScan?.status === "loading_model" ? "Loading the detection model into memory…" : "Running YOLO detection on each frame…"}</span>
                           {videoPhase === "processing" && (videoScan?.total_frames ?? 0) > 0 && (
                             <strong>{videoScan.current_frame.toLocaleString()} / {videoScan.total_frames.toLocaleString()} frames</strong>
                           )}
