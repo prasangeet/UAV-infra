@@ -591,7 +591,7 @@ function App() {
                         </div>
                         <div className="video-progress-meta">
                           <span>{videoPhase === "uploading" ? "Transferring file to the local inference service…" : videoScan?.status === "queued" ? "Waiting for the inference worker…" : "Running YOLO detection on each frame…"}</span>
-                          {videoPhase === "processing" && videoScan?.total_frames > 0 && (
+                          {videoPhase === "processing" && (videoScan?.total_frames ?? 0) > 0 && (
                             <strong>{videoScan.current_frame.toLocaleString()} / {videoScan.total_frames.toLocaleString()} frames</strong>
                           )}
                         </div>
