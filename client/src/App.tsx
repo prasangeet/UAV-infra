@@ -273,7 +273,7 @@ function App() {
               {cameraOn && <span className="fps-counter">{fps || "—"} FPS</span>}
             </div>
             <div className="feed-stage">
-              <video ref={videoRef} className="camera-source" muted playsInline />
+              <video ref={videoRef} className={cameraOn && source === "camera" && !annotatedFrame ? "camera-source visible" : "camera-source"} muted playsInline />
               {cameraOn && source === "camera" && annotatedFrame && (
                 <img className="annotated-preview" src={annotatedFrame} alt="Live annotated detection frame" />
               )}
