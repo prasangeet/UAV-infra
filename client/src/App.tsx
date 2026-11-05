@@ -346,6 +346,7 @@ function App() {
     setVideoUploadProgress(0);
     setVideoError("");
     setVideoAcknowledged(false);
+    setShowVideoPreview(false);
     videoTaskActiveRef.current = false;
     setVideoPhase("review");
   }
