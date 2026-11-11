@@ -47,7 +47,7 @@ def main() -> None:
         split="test",
         imgsz=IMAGE_SIZE,
         batch=BATCH_SIZE,
-        device=DEVICE,q
+        device=DEVICE,
         workers=WORKERS,
         project=str(PROJECT_DIR),
         name=RUN_NAME,
