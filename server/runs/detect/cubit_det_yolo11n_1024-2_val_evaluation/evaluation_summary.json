@@ -1,0 +1,50 @@
+{
+  "evaluated_at": "2026-11-05T01:07:12+05:30",
+  "checkpoint": "/mnt/volume/Projects/UAV-II/runs/detect/cubit_det_yolo11n_1024-2/weights/best.pt",
+  "dataset_yaml": "/mnt/volume/Projects/UAV-II/data/cubit_det/data.yaml",
+  "split": "val",
+  "imgsz": 1024,
+  "batch": 2,
+  "device": "0",
+  "confidence_threshold": 0.001,
+  "nms_iou_threshold": 0.6,
+  "metrics": {
+    "precision": 0.7079696533615576,
+    "recall": 0.624013696474372,
+    "map50": 0.6637553006717574,
+    "map50_95": 0.39904062932089995
+  },
+  "speed_ms_per_image": {
+    "preprocess": 1.1912346425482636,
+    "inference": 13.878543000021748,
+    "loss": 0.004374429832808663,
+    "postprocess": 0.9152409773551012
+  },
+  "per_class": [
+    {
+      "class_id": 0,
+      "class_name": "Crack",
+      "precision": 0.701456946306243,
+      "recall": 0.5755395683453237,
+      "map50": 0.6619638196264286,
+      "map50_95": 0.365461336594139
+    },
+    {
+      "class_id": 1,
+      "class_name": "Spalling",
+      "precision": 0.8348957689303526,
+      "recall": 0.7371794871794872,
+      "map50": 0.8220692393171967,
+      "map50_95": 0.5638058220992896
+    },
+    {
+      "class_id": 2,
+      "class_name": "Moisture",
+      "precision": 0.587556244848077,
+      "recall": 0.559322033898305,
+      "map50": 0.5072328430716467,
+      "map50_95": 0.2678547292692711
+    }
+  ],
+  "results_directory": "/mnt/volume/Projects/UAV-II/runs/detect/cubit_det_yolo11n_1024-2_val_evaluation"
+}

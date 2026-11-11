@@ -1,0 +1,17 @@
+
+Run name: cubit_det_yolo11n_1024
+Dataset: Original CUBIT-Det (non-tiled)
+Dataset YAML: /mnt/volume/Projects/UAV-II/data/cubit_det/data.yaml
+Model/checkpoint: yolo11n.pt
+Image size: 1024
+Batch size: 4
+Workers: 2
+Epochs requested: 50
+Patience: 10
+Device: 0
+AMP: true
+Optimizer: AdamW
+Initial learning rate: 0.001
+Weight decay: 0.0005
+Updated: 2026-11-05T01:01:35+05:30
+Status: training_call_finished

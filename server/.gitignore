@@ -10,8 +10,6 @@ wheels/
 .venv
 
 data
-reports
-runs
 
 # Local configuration (keep the example file tracked)
 .env

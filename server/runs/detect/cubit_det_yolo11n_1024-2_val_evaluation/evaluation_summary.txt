@@ -1,0 +1,24 @@
+YOLO OBJECT DETECTION EVALUATION
+========================================
+Checkpoint: /mnt/volume/Projects/UAV-II/runs/detect/cubit_det_yolo11n_1024-2/weights/best.pt
+Dataset:    /mnt/volume/Projects/UAV-II/data/cubit_det/data.yaml
+Split:      val
+Image size: 1024
+
+Overall metrics
+Precision:  0.7079696533615576
+Recall:     0.624013696474372
+mAP50:      0.6637553006717574
+mAP50-95:   0.39904062932089995
+
+Speed (ms/image)
+preprocess: 1.1912346425482636
+inference: 13.878543000021748
+loss: 0.004374429832808663
+postprocess: 0.9152409773551012
+
+Per-class metrics
+Class ID | Class | Precision | Recall | mAP50 | mAP50-95
+0 | Crack | 0.701456946306243 | 0.5755395683453237 | 0.6619638196264286 | 0.365461336594139
+1 | Spalling | 0.8348957689303526 | 0.7371794871794872 | 0.8220692393171967 | 0.5638058220992896
+2 | Moisture | 0.587556244848077 | 0.559322033898305 | 0.5072328430716467 | 0.2678547292692711
